@@ -1,6 +1,18 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+import os
+import io
+import csv
+import json
+import random
+import hashlib
+import secrets
+import sqlite3
+import pickle
+import base64
 import joblib
+import numpy as np
+import uvicorn
 
 # Load mô hình SVM đã huấn luyện
 model = joblib.load("svm_model.pkl")
