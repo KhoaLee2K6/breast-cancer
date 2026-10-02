@@ -4,13 +4,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import os
+import pandas as pd
 import io
 import math
 import numpy as np
-import pandas as pd
 import joblib
 import uvicorn
-import pandas as pd
 
 # ML (survival dataset)
 from sklearn.model_selection import train_test_split
