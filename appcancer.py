@@ -7,6 +7,7 @@ import os
 import io
 import math
 import numpy as np
+import pandas as pd
 import joblib
 import uvicorn
 import pandas as pd
