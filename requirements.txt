@@ -3,3 +3,6 @@ uvicorn[standard]
 scikit-learn
 joblib
 pydantic
+numpy
+pandas
+python-multipart
