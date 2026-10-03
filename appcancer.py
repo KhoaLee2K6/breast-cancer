@@ -44,7 +44,6 @@ DEFAULT_ADMIN_USER  = os.environ.get("BC_ADMIN_USER", "admin")
 DEFAULT_ADMIN_PASS  = os.environ.get("BC_ADMIN_PASS", "Admin@123")
 ALLOW_REGISTRATION  = os.environ.get("BC_ALLOW_REGISTER", "1") == "1"
 
-# ---- SQL schema (parameterized queries everywhere → chống SQL Injection)
 SQL_CREATE_USERS = """
 CREATE TABLE IF NOT EXISTS users (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,13 +116,10 @@ def _now_iso() -> str:
 
 
 def init_auth_db() -> None:
-    """Khởi tạo schema + seed admin mặc định."""
     with db_conn() as conn:
         conn.executescript(SQL_CREATE_USERS)
         conn.executescript(SQL_CREATE_SESSIONS)
         conn.executescript(SQL_CREATE_AUDIT)
-
-        # Seed default admin nếu DB trống
         row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
         if row["c"] == 0:
             conn.execute(
@@ -135,7 +131,6 @@ def init_auth_db() -> None:
             print(f"[AUTH] Seeded default admin user: {DEFAULT_ADMIN_USER}")
 
 
-# ---------- Password hashing (PBKDF2-HMAC-SHA256) ----------
 def hash_password(password: str) -> str:
     if not password or len(password) < 6:
         raise ValueError("Mật khẩu phải có ít nhất 6 ký tự.")
@@ -157,7 +152,6 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-# ---------- Audit log ----------
 def audit_log(username: Optional[str], ip: Optional[str], ua: Optional[str],
               success: bool, reason: str = "") -> None:
     try:
@@ -172,7 +166,6 @@ def audit_log(username: Optional[str], ip: Optional[str], ua: Optional[str],
         print(f"[AUDIT] {exc}")
 
 
-# ---------- Authenticate / create session ----------
 def authenticate(username: str, password: str, ip: str, ua: str) -> Dict[str, Any]:
     with db_conn() as conn:
         row = conn.execute(
@@ -190,7 +183,6 @@ def authenticate(username: str, password: str, ip: str, ua: str) -> Dict[str, An
             audit_log(username, ip, ua, False, "inactive")
             return {"ok": False, "reason": "Tài khoản đã bị vô hiệu hoá."}
 
-        # Lock check
         locked_until = row["locked_until"]
         if locked_until:
             try:
@@ -222,7 +214,6 @@ def authenticate(username: str, password: str, ip: str, ua: str) -> Dict[str, An
                                   f"Tài khoản bị khoá {LOCKOUT_MINUTES} phút."}
             return {"ok": False, "reason": "Tên đăng nhập hoặc mật khẩu không đúng."}
 
-        # Success
         conn.execute(
             "UPDATE users SET failed_attempts = 0, locked_until = NULL, "
             "                 last_login_at = ? WHERE id = ?",
@@ -293,7 +284,7 @@ def cleanup_expired_sessions() -> None:
 
 
 # ==============================================================
-# 1. MODEL  —  graceful loading  (SVM 30 features - gốc)
+# 1. MODEL
 # ==============================================================
 MODEL_PATH = os.environ.get("BC_MODEL_PATH", "svm_model.pkl")
 
@@ -312,7 +303,7 @@ except Exception as exc:
 
 
 # ==============================================================
-# 1b. SURVIVAL DATASET  (cho dashboard phân tích)
+# 1b. SURVIVAL DATASET
 # ==============================================================
 DATA_PATH = os.environ.get("BC_DATA_PATH", "breast_cancer.csv")
 
@@ -645,14 +636,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Khởi tạo DB ngay khi app start
 @app.on_event("startup")
 def _startup():
     init_auth_db()
     cleanup_expired_sessions()
 
 
-# ---------- Middleware xác thực ----------
 PUBLIC_PATHS = {
     "/login", "/api/auth/login", "/api/auth/register",
     "/favicon.ico", "/docs", "/openapi.json", "/redoc",
@@ -689,7 +678,6 @@ def _client_ip(request: Request) -> str:
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    # Nếu đã đăng nhập → chuyển về dashboard
     if get_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse("/", status_code=302)
     return LOGIN_TEMPLATE
@@ -708,7 +696,7 @@ def api_login(payload: LoginPayload, request: Request, response: Response):
     response.set_cookie(
         key=SESSION_COOKIE, value=token,
         max_age=SESSION_TTL_HOURS * 3600,
-        httponly=True, samesite="lax", secure=False,  # secure=True khi chạy HTTPS
+        httponly=True, samesite="lax", secure=False,
         path="/",
     )
     return {"ok": True, "user": user}
@@ -721,7 +709,6 @@ def api_register(payload: RegisterPayload, request: Request, response: Response)
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")
 
-    # Validate sơ bộ
     if not payload.username.replace("_", "").replace(".", "").isalnum():
         raise HTTPException(status_code=400, detail="Username chỉ gồm chữ, số, '_', '.'.")
 
@@ -732,7 +719,6 @@ def api_register(payload: RegisterPayload, request: Request, response: Response)
 
     try:
         with db_conn() as conn:
-            # Kiểm tra tồn tại (parameterized → chống SQL Injection)
             exists = conn.execute(
                 "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE",
                 (payload.username,),
@@ -750,7 +736,6 @@ def api_register(payload: RegisterPayload, request: Request, response: Response)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi tạo tài khoản: {exc}")
 
-    # Auto login
     result = authenticate(payload.username, payload.password, ip, ua)
     if not result["ok"]:
         return {"ok": True, "user": None, "message": "Đăng ký thành công, hãy đăng nhập."}
@@ -1242,11 +1227,6 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
   --font:'Plus Jakarta Sans',system-ui,sans-serif;
   --mono:'JetBrains Mono',monospace;
 }
-[data-theme="light"]{
-  --bg:#f1f5f9; --surface:rgba(255,255,255,.85); --surface-2:rgba(241,245,249,.7);
-  --text:#0f172a; --text-muted:#475569; --text-soft:#94a3b8;
-  --border:rgba(15,23,42,.08); --border-strong:rgba(15,23,42,.18);
-}
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%;margin:0}
 body{
@@ -1254,8 +1234,6 @@ body{
   overflow-x:hidden; -webkit-font-smoothing:antialiased;
   display:grid; place-items:center; min-height:100vh; padding:24px;
 }
-
-/* === Animated gradient orbs background === */
 .bg{position:fixed;inset:0;overflow:hidden;z-index:0;pointer-events:none}
 .orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.55;
   animation:float 22s ease-in-out infinite}
@@ -1274,8 +1252,6 @@ body{
   background-size:44px 44px;
   mask-image:radial-gradient(ellipse at center,black 40%,transparent 75%);
 }
-
-/* === Layout === */
 .shell{position:relative;z-index:2;width:100%;max-width:1080px;
   display:grid;grid-template-columns:1fr 1fr;gap:0;
   background:var(--surface);backdrop-filter:blur(24px) saturate(160%);
@@ -1284,8 +1260,6 @@ body{
   box-shadow:0 30px 60px -20px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.02) inset;
   overflow:hidden;animation:rise .7s cubic-bezier(.2,.9,.3,1.2)}
 @keyframes rise{from{opacity:0;transform:translateY(20px) scale(.98)}to{opacity:1;transform:none}}
-
-/* === Left brand panel === */
 .brand{padding:52px 44px;background:
   linear-gradient(150deg,rgba(37,99,235,.22) 0%,rgba(16,185,129,.10) 55%,transparent 100%);
   border-right:1px solid var(--border);display:flex;flex-direction:column;gap:20px;position:relative;overflow:hidden}
@@ -1315,8 +1289,6 @@ body{
   color:#60a5fa;font-size:16px;flex-shrink:0;border:1px solid rgba(96,165,250,.25)}
 .feat__t{font-size:13px;font-weight:700}
 .feat__d{font-size:11.5px;color:var(--text-muted);margin-top:2px;line-height:1.5}
-
-/* === Right form panel === */
 .form{padding:52px 44px;display:flex;flex-direction:column;justify-content:center;gap:20px}
 .form__head{margin-bottom:4px}
 .form__head h2{font-size:26px;font-weight:800;letter-spacing:-.6px;margin:0}
@@ -1351,14 +1323,12 @@ body{
   border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;
   vertical-align:-2px;margin-right:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
-
 .msg{padding:11px 14px;border-radius:10px;font-size:12.5px;line-height:1.55;
   display:none;align-items:flex-start;gap:8px;animation:fade .3s ease}
 .msg.show{display:flex}
 .msg--err{background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.35)}
 .msg--ok{background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.35)}
 @keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-
 .hint{font-size:11.5px;color:var(--text-soft);text-align:center;line-height:1.6}
 .hint code{font-family:var(--mono);font-size:11px;background:var(--surface-2);
   padding:2px 6px;border-radius:5px;color:#93c5fd;border:1px solid var(--border)}
@@ -1368,7 +1338,6 @@ body{
   padding:5px 10px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border)}
 .pw-toggle{position:absolute;right:12px;top:50%;transform:translateY(-50%);
   background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:14px;padding:4px}
-
 @media (max-width: 860px){
   .shell{grid-template-columns:1fr;max-width:480px}
   .brand{padding:34px 26px;border-right:none;border-bottom:1px solid var(--border)}
@@ -1385,7 +1354,6 @@ body{
 <div class="grid-overlay"></div>
 
 <main class="shell">
-  <!-- Brand panel -->
   <section class="brand">
     <div class="brand__logo">
       <div class="logo-mark">BC</div>
@@ -1421,7 +1389,6 @@ body{
     </div>
   </section>
 
-  <!-- Form panel -->
   <section class="form">
     <div class="form__head">
       <h2>Đăng nhập hệ thống</h2>
@@ -1435,7 +1402,6 @@ body{
 
     <div class="msg" id="msg"></div>
 
-    <!-- Login form -->
     <form id="formLogin" autocomplete="on">
       <div class="field">
         <label for="loginUser">Tên đăng nhập</label>
@@ -1457,7 +1423,6 @@ body{
       </button>
     </form>
 
-    <!-- Register form -->
     <form id="formRegister" hidden autocomplete="off">
       <div class="field">
         <label for="regUser">Tên đăng nhập</label>
@@ -1586,10 +1551,10 @@ $("formRegister").addEventListener("submit", async (e) => {
 
 
 # ==============================================================
-# 4b. DASHBOARD TEMPLATE (đã beautify)
+# 4b. DASHBOARD TEMPLATE — RỰC RỠ, BẮT MẮT
 # ==============================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="vi" data-theme="light">
+<html lang="vi" data-theme="dark">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1602,320 +1567,810 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/@sgratzl/chartjs-chart-boxplot@4.4.1/build/index.umd.min.js"></script>
 <style>
 /* ============================================================
-   Palette — 4 tông chính
-   🔵 blue   → thông tin chung
-   🟢 green  → Alive / Positive
-   🔴 red    → Dead / Negative
-   ⚪ gray   → nền / phụ trợ
+   PALETTE
    ============================================================ */
 :root{
-  --blue:#2563eb;--blue-dark:#1d4ed8;--blue-soft:#dbeafe;--blue-glow:rgba(37,99,235,.32);
-  --green:#16a34a;--green-dark:#15803d;--green-soft:#dcfce7;
-  --red:#dc2626;--red-dark:#b91c1c;--red-soft:#fee2e2;
-  --gray:#64748b;--gray-dark:#475569;--gray-soft:#f1f5f9;
+  --blue:#6366f1;--blue-dark:#4f46e5;--blue-soft:rgba(99,102,241,.14);
+  --blue-glow:rgba(99,102,241,.45);
+  --cyan:#06b6d4;--cyan-soft:rgba(6,182,212,.16);
+  --purple:#a855f7;--purple-soft:rgba(168,85,247,.16);
+  --pink:#ec4899;--pink-soft:rgba(236,72,153,.16);
+  --green:#10b981;--green-dark:#059669;--green-soft:rgba(16,185,129,.14);
+  --amber:#f59e0b;--amber-soft:rgba(245,158,11,.14);
+  --red:#ef4444;--red-dark:#dc2626;--red-soft:rgba(239,68,68,.14);
+  --gray:#94a3b8;--gray-dark:#64748b;--gray-soft:rgba(148,163,184,.14);
 
-  --bg:#f8fafc;--surface:#fff;--surface-2:#f8fafc;--surface-3:#f1f5f9;
-  --text:#0f172a;--text-muted:#64748b;--text-soft:#94a3b8;
-  --border:#e2e8f0;--border-strong:#cbd5e1;
+  --bg:#050814;
+  --bg-2:#0a0f24;
+  --surface:rgba(17,24,45,.72);
+  --surface-2:rgba(30,41,68,.55);
+  --surface-3:rgba(45,58,90,.5);
+  --surface-solid:#0f172a;
+  --text:#f1f5f9;--text-muted:#94a3b8;--text-soft:#64748b;
+  --border:rgba(148,163,184,.16);
+  --border-strong:rgba(148,163,184,.3);
 
   --radius:12px;--radius-lg:18px;
-  --shadow-sm:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
-  --shadow:0 10px 30px -12px rgba(15,23,42,.15),0 2px 6px rgba(15,23,42,.05);
-  --shadow-lg:0 24px 60px -20px rgba(15,23,42,.24);
+  --shadow-sm:0 1px 3px rgba(0,0,0,.4);
+  --shadow:0 12px 34px -14px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.35);
+  --shadow-lg:0 30px 80px -30px rgba(0,0,0,.9);
   --font:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
   --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
-  --transition:200ms cubic-bezier(.4,0,.2,1);
+  --transition:220ms cubic-bezier(.4,0,.2,1);
 }
-[data-theme="dark"]{
-  --bg:#020617;--surface:#0f172a;--surface-2:#111c33;--surface-3:#1e293b;
-  --text:#f1f5f9;--text-muted:#94a3b8;--text-soft:#64748b;
-  --border:#1e293b;--border-strong:#334155;
-  --blue:#60a5fa;--blue-soft:rgba(96,165,250,.14);--blue-glow:rgba(96,165,250,.35);
-  --green:#4ade80;--green-soft:rgba(74,222,128,.14);
-  --red:#f87171;--red-soft:rgba(248,113,113,.14);
-  --gray:#94a3b8;--gray-soft:rgba(148,163,184,.14);
-  --shadow:0 10px 30px -12px rgba(0,0,0,.5);
-  --shadow-lg:0 24px 60px -20px rgba(0,0,0,.7);
+[data-theme="light"]{
+  --bg:#eef2ff;
+  --bg-2:#f8fafc;
+  --surface:rgba(255,255,255,.85);
+  --surface-2:rgba(241,245,249,.75);
+  --surface-3:rgba(226,232,240,.65);
+  --surface-solid:#fff;
+  --text:#0f172a;--text-muted:#475569;--text-soft:#94a3b8;
+  --border:rgba(15,23,42,.08);
+  --border-strong:rgba(15,23,42,.18);
+  --shadow:0 12px 34px -18px rgba(15,23,42,.3), 0 2px 6px rgba(15,23,42,.06);
+  --shadow-lg:0 30px 70px -30px rgba(15,23,42,.35);
 }
+
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;font-family:var(--font);font-size:14px;line-height:1.55;color:var(--text);
-  background:var(--bg);padding:22px 16px 60px;-webkit-font-smoothing:antialiased;
-  position:relative;overflow-x:hidden}
-/* subtle ambient */
-body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:
-    radial-gradient(1000px 500px at 10% -10%,rgba(37,99,235,.08),transparent 60%),
-    radial-gradient(900px 500px at 110% 10%,rgba(22,163,74,.06),transparent 60%);
+
+/* ============================================================
+   AURORA BACKGROUND (rực rỡ)
+   ============================================================ */
+body{
+  margin:0;font-family:var(--font);font-size:14px;line-height:1.55;color:var(--text);
+  background:var(--bg);
+  padding:22px 16px 60px;-webkit-font-smoothing:antialiased;
+  position:relative;overflow-x:hidden;min-height:100vh;
 }
+
+/* Aurora gradient mesh */
+body::before{
+  content:"";position:fixed;inset:-20%;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(900px 600px at 8% -10%,rgba(99,102,241,.35),transparent 55%),
+    radial-gradient(800px 600px at 100% 0%,rgba(6,182,212,.28),transparent 55%),
+    radial-gradient(900px 700px at 50% 110%,rgba(168,85,247,.28),transparent 55%),
+    radial-gradient(700px 500px at 90% 80%,rgba(236,72,153,.22),transparent 55%),
+    radial-gradient(700px 500px at 10% 90%,rgba(16,185,129,.2),transparent 55%);
+  animation:auroraShift 30s ease-in-out infinite alternate;
+}
+[data-theme="light"] body::before{opacity:.55;}
+
+@keyframes auroraShift{
+  0%   {transform:translate(0,0) scale(1)}
+  50%  {transform:translate(-3%,2%) scale(1.05)}
+  100% {transform:translate(2%,-2%) scale(1.08)}
+}
+
+/* Subtle grid overlay */
+body::after{
+  content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.35;
+  background-image:
+    linear-gradient(rgba(148,163,184,.05) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(148,163,184,.05) 1px,transparent 1px);
+  background-size:48px 48px;
+  mask-image:radial-gradient(ellipse at center,black 35%,transparent 75%);
+  -webkit-mask-image:radial-gradient(ellipse at center,black 35%,transparent 75%);
+}
+
+/* Floating orbs */
+.orb-field{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+.orb-field span{position:absolute;border-radius:50%;filter:blur(70px);opacity:.5;
+  animation:float 26s ease-in-out infinite}
+.orb-field span:nth-child(1){width:400px;height:400px;background:radial-gradient(circle,#6366f1,#4338ca);top:-100px;left:-80px}
+.orb-field span:nth-child(2){width:360px;height:360px;background:radial-gradient(circle,#06b6d4,#0e7490);top:30%;right:-120px;animation-delay:-8s}
+.orb-field span:nth-child(3){width:320px;height:320px;background:radial-gradient(circle,#a855f7,#6b21a8);bottom:-120px;left:25%;animation-delay:-16s}
+.orb-field span:nth-child(4){width:280px;height:280px;background:radial-gradient(circle,#ec4899,#9d174d);bottom:20%;right:10%;animation-delay:-22s}
+[data-theme="light"] .orb-field span{opacity:.35}
+
+@keyframes float{
+  0%,100%{transform:translate(0,0) scale(1)}
+  33%{transform:translate(50px,-40px) scale(1.1)}
+  66%{transform:translate(-40px,50px) scale(.94)}
+}
+
 h1,h2,h3,p{margin:0}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
 :focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:4px}
 
-.app{max-width:1320px;margin:0 auto;display:flex;flex-direction:column;gap:16px;position:relative;z-index:1}
+.app{max-width:1340px;margin:0 auto;display:flex;flex-direction:column;gap:18px;position:relative;z-index:1}
 
-/* ---------- Header ---------- */
-.header{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius-lg);padding:24px 28px;box-shadow:var(--shadow);
+/* ============================================================
+   HEADER — glass rực rỡ
+   ============================================================ */
+.header{
+  position:relative;overflow:hidden;
+  background:linear-gradient(135deg,rgba(30,41,68,.7),rgba(17,24,45,.85));
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  border:1px solid var(--border);
+  border-radius:22px;padding:26px 30px;
+  box-shadow:var(--shadow-lg);
   display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap;
-  position:relative;overflow:hidden}
-.header::after{content:"";position:absolute;inset:0;pointer-events:none;
-  background:linear-gradient(120deg,rgba(37,99,235,.06),transparent 40%,rgba(22,163,74,.05) 100%)}
-.header__title{font-size:26px;font-weight:800;letter-spacing:-.6px;
-  background:linear-gradient(120deg,var(--text) 30%,var(--text-muted) 130%);
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-.header__desc{font-size:13.5px;color:var(--text-muted);margin-top:6px;max-width:680px}
-.header__actions{display:flex;align-items:center;gap:10px;position:relative;z-index:1}
-.status{font-size:12px;font-weight:600;padding:7px 13px;border-radius:999px;
-  background:var(--surface-3);color:var(--text-muted);border:1px solid var(--border);
-  display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+}
+[data-theme="light"] .header{background:linear-gradient(135deg,rgba(255,255,255,.9),rgba(238,242,255,.85))}
+
+/* Rainbow border shine */
+.header::before{
+  content:"";position:absolute;inset:0;border-radius:22px;padding:1px;
+  background:linear-gradient(120deg,
+    rgba(99,102,241,.7),rgba(6,182,212,.6),
+    rgba(168,85,247,.6),rgba(236,72,153,.6),rgba(99,102,241,.7));
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;opacity:.65;
+}
+.header::after{
+  content:"";position:absolute;top:-40%;left:-10%;width:60%;height:180%;
+  background:radial-gradient(circle,rgba(99,102,241,.18),transparent 65%);
+  pointer-events:none;
+  animation:headerShine 14s ease-in-out infinite;
+}
+@keyframes headerShine{
+  0%,100%{transform:translateX(0)}
+  50%{transform:translateX(60%)}
+}
+.header__title{
+  font-size:27px;font-weight:800;letter-spacing:-.7px;
+  background:linear-gradient(120deg,#a5b4fc 0%,#67e8f9 35%,#f0abfc 70%,#fbcfe8 100%);
+  background-size:200% 200%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:textFlow 8s ease-in-out infinite;
+  position:relative;z-index:1;
+}
+@keyframes textFlow{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+[data-theme="light"] .header__title{
+  background:linear-gradient(120deg,#4f46e5 0%,#0891b2 35%,#9333ea 70%,#db2777 100%);
+  background-size:200% 200%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.header__desc{font-size:13.5px;color:var(--text-muted);margin-top:8px;max-width:700px;position:relative;z-index:1}
+.header__actions{display:flex;align-items:center;gap:10px;position:relative;z-index:1;flex-wrap:wrap}
+
+.status{
+  font-size:12px;font-weight:600;padding:8px 14px;border-radius:999px;
+  background:var(--surface-2);color:var(--text-muted);
+  border:1px solid var(--border);
+  display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
+  backdrop-filter:blur(8px);
+}
 .status::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;
   box-shadow:0 0 0 0 currentColor;animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{box-shadow:0 0 0 0 currentColor;opacity:1}50%{box-shadow:0 0 0 6px transparent;opacity:.6}}
-.status.is-online{background:var(--green-soft);color:var(--green);border-color:var(--green)}
-.status.is-offline{background:var(--red-soft);color:var(--red);border-color:var(--red)}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 currentColor;opacity:1}50%{box-shadow:0 0 0 8px transparent;opacity:.55}}
+.status.is-online{background:var(--green-soft);color:var(--green);border-color:rgba(16,185,129,.45)}
+.status.is-offline{background:var(--red-soft);color:var(--red);border-color:rgba(239,68,68,.45)}
 .status.is-checking{background:var(--gray-soft);color:var(--gray)}
-.theme-btn{width:38px;height:38px;display:grid;place-items:center;background:var(--surface-3);
-  border:1px solid var(--border);border-radius:10px;font-size:16px;transition:all var(--transition)}
-.theme-btn:hover{border-color:var(--blue);color:var(--blue);transform:translateY(-1px)}
-.user-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 12px 6px 6px;
-  background:var(--surface-3);border:1px solid var(--border);border-radius:999px;
-  font-size:12px;font-weight:600;color:var(--text-muted)}
-.user-chip__av{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
-  background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:#fff;font-size:11px;font-weight:800}
-.logout-btn{padding:7px 13px;font-size:12px;font-weight:600;background:transparent;
-  border:1px solid var(--border);border-radius:10px;color:var(--text-muted);transition:all var(--transition)}
-.logout-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-soft)}
 
-/* ---------- Tabs ---------- */
-.tabs{display:flex;gap:4px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius-lg);padding:6px;box-shadow:var(--shadow-sm);position:relative;overflow-x:auto}
-.tab{display:inline-flex;align-items:center;gap:7px;padding:10px 15px;font-size:12.5px;
-  font-weight:600;border-radius:var(--radius);border:none;background:transparent;
-  color:var(--text-muted);transition:all var(--transition);white-space:nowrap;position:relative}
-.tab:hover{background:var(--surface-3);color:var(--text)}
-.tab.is-active{background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:#fff;
-  box-shadow:0 10px 22px -10px var(--blue-glow)}
+.user-chip{
+  display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 6px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:999px;
+  font-size:12px;font-weight:600;color:var(--text-muted);backdrop-filter:blur(8px);
+}
+.user-chip__av{
+  width:28px;height:28px;border-radius:50%;display:grid;place-items:center;
+  background:linear-gradient(135deg,#6366f1,#a855f7,#ec4899);
+  background-size:200% 200%;
+  color:#fff;font-size:11px;font-weight:800;
+  box-shadow:0 4px 12px -2px rgba(168,85,247,.6);
+  animation:avatarFlow 6s ease-in-out infinite;
+}
+@keyframes avatarFlow{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
 
-/* ---------- Panels ---------- */
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
-  box-shadow:var(--shadow);overflow:hidden;animation:panelIn .35s ease}
-@keyframes panelIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.panel__head{display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:15px 22px;border-bottom:1px solid var(--border);flex-wrap:wrap}
-.panel__head h2{font-size:15px;font-weight:700;display:flex;align-items:center;gap:9px}
-.panel__head h2::before{content:"";width:4px;height:16px;border-radius:2px;
-  background:linear-gradient(180deg,var(--blue),var(--blue-dark))}
-.panel__body{padding:20px 22px}
-.tabpanel{display:none;flex-direction:column;gap:16px}
-.tabpanel.is-active{display:flex}
+.theme-btn{
+  width:40px;height:40px;display:grid;place-items:center;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:12px;
+  font-size:16px;transition:all var(--transition);backdrop-filter:blur(8px);
+}
+.theme-btn:hover{border-color:var(--blue);color:var(--blue);transform:translateY(-2px) rotate(-15deg);
+  box-shadow:0 10px 24px -10px var(--blue-glow)}
 
-/* ---------- Stat cards ---------- */
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
-.stat{padding:18px 20px;border:1px solid var(--border);border-radius:var(--radius);
-  background:var(--surface);position:relative;overflow:hidden;transition:all var(--transition)}
-.stat::before{content:"";position:absolute;inset:0;opacity:0;transition:opacity var(--transition);
-  background:linear-gradient(135deg,rgba(37,99,235,.06),transparent)}
-.stat:hover{box-shadow:var(--shadow);transform:translateY(-2px);border-color:var(--border-strong)}
-.stat:hover::before{opacity:1}
-.stat__icon{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
-  font-size:18px;background:var(--surface-3);margin-bottom:10px;position:relative;z-index:1}
-.stat__label{font-size:11px;font-weight:700;color:var(--text-muted);
-  text-transform:uppercase;letter-spacing:.08em;position:relative;z-index:1}
-.stat__value{font-size:28px;font-weight:800;font-family:var(--mono);margin-top:4px;
-  letter-spacing:-.6px;color:var(--text);position:relative;z-index:1}
-.stat__value.blue{color:var(--blue)}
-.stat__value.green{color:var(--green)}
-.stat__value.red{color:var(--red)}
-.stat__value.gray{color:var(--gray-dark)}
+.logout-btn{
+  padding:9px 15px;font-size:12px;font-weight:700;
+  background:transparent;border:1px solid var(--border);border-radius:11px;
+  color:var(--text-muted);transition:all var(--transition);
+}
+.logout-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-soft);
+  box-shadow:0 10px 22px -12px rgba(239,68,68,.6)}
 
-/* ---------- Chart cards ---------- */
-.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
-.chart-grid.two{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
-.chart-card{border:1px solid var(--border);border-radius:var(--radius);padding:18px;
-  background:var(--surface);display:flex;flex-direction:column;gap:6px;transition:all var(--transition)}
-.chart-card:hover{box-shadow:var(--shadow-sm)}
-.chart-card__title{font-size:13.5px;font-weight:700;color:var(--text)}
-.chart-card__desc{font-size:11.5px;color:var(--text-muted);line-height:1.55;margin-bottom:6px}
-.chart-wrap{position:relative;height:270px}
-.chart-wrap.tall{height:380px}
+/* ============================================================
+   TABS — pill với indicator động
+   ============================================================ */
+.tabs{
+  position:relative;
+  display:flex;gap:5px;flex-wrap:wrap;
+  background:var(--surface);backdrop-filter:blur(16px) saturate(160%);
+  -webkit-backdrop-filter:blur(16px) saturate(160%);
+  border:1px solid var(--border);border-radius:18px;padding:7px;
+  box-shadow:var(--shadow);
+  overflow-x:auto;
+}
+.tabs::before{
+  content:"";position:absolute;inset:0;border-radius:18px;padding:1px;
+  background:linear-gradient(120deg,rgba(99,102,241,.35),rgba(168,85,247,.25),rgba(6,182,212,.3));
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;opacity:.6;
+}
+.tab{
+  display:inline-flex;align-items:center;gap:7px;padding:11px 16px;font-size:12.5px;
+  font-weight:600;border-radius:13px;border:none;background:transparent;
+  color:var(--text-muted);transition:all var(--transition);
+  white-space:nowrap;position:relative;z-index:1;
+}
+.tab:hover{background:var(--surface-2);color:var(--text)}
+.tab.is-active{
+  background:linear-gradient(135deg,#6366f1 0%,#4f46e5 45%,#7c3aed 100%);
+  color:#fff;
+  box-shadow:0 12px 28px -12px var(--blue-glow), inset 0 1px 0 rgba(255,255,255,.18);
+  transform:translateY(-1px);
+}
+.tab.is-active::after{
+  content:"";position:absolute;left:12px;right:12px;bottom:-4px;height:3px;
+  background:linear-gradient(90deg,transparent,#a5b4fc,#67e8f9,transparent);
+  border-radius:3px;filter:blur(.5px);
+  animation:tabShine 3s ease-in-out infinite;
+}
+@keyframes tabShine{
+  0%,100%{opacity:.4}
+  50%{opacity:1}
+}
 
-/* ---------- Table ---------- */
-.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:var(--radius);
-  background:var(--surface)}
+/* ============================================================
+   PANELS — glass rực rỡ
+   ============================================================ */
+.panel{
+  position:relative;
+  background:var(--surface);
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  border:1px solid var(--border);border-radius:20px;
+  box-shadow:var(--shadow);overflow:hidden;
+  animation:panelIn .45s cubic-bezier(.4,0,.2,1);
+}
+[data-theme="light"] .panel{background:linear-gradient(135deg,rgba(255,255,255,.9),rgba(248,250,252,.85))}
+
+.panel::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(165,180,252,.6),transparent);
+  pointer-events:none;
+}
+@keyframes panelIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+.panel__head{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:16px 24px;border-bottom:1px solid var(--border);flex-wrap:wrap;
+  background:linear-gradient(90deg,rgba(99,102,241,.06),transparent 40%);
+}
+.panel__head h2{
+  font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px;
+  letter-spacing:-.2px;
+}
+.panel__head h2::before{
+  content:"";width:4px;height:18px;border-radius:3px;
+  background:linear-gradient(180deg,#6366f1,#a855f7,#ec4899);
+  box-shadow:0 0 12px rgba(168,85,247,.6);
+}
+.panel__body{padding:22px 24px}
+
+.tabpanel{display:none;flex-direction:column;gap:18px}
+.tabpanel.is-active{display:flex;animation:panelIn .35s ease}
+
+/* ============================================================
+   STAT CARDS — gradient border, icon glow
+   ============================================================ */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:14px}
+
+.stat{
+  position:relative;padding:20px 22px;
+  background:var(--surface-2);
+  border:1px solid var(--border);border-radius:16px;
+  overflow:hidden;transition:all var(--transition);
+  backdrop-filter:blur(10px);
+}
+.stat::before{
+  content:"";position:absolute;inset:0;border-radius:16px;padding:1px;
+  background:linear-gradient(135deg,rgba(99,102,241,.4),transparent 55%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  opacity:.6;transition:opacity var(--transition);
+}
+.stat:hover{
+  transform:translateY(-3px);
+  box-shadow:0 18px 40px -18px rgba(99,102,241,.55);
+  border-color:transparent;
+}
+.stat:hover::before{
+  background:linear-gradient(135deg,rgba(99,102,241,.9),rgba(168,85,247,.8),rgba(236,72,153,.7));
+  opacity:1;
+}
+
+.stat__icon{
+  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;
+  font-size:20px;margin-bottom:12px;
+  background:linear-gradient(135deg,rgba(99,102,241,.22),rgba(168,85,247,.14));
+  border:1px solid rgba(165,180,252,.25);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 8px 20px -10px rgba(99,102,241,.5);
+}
+.stat__label{
+  font-size:11px;font-weight:700;color:var(--text-muted);
+  text-transform:uppercase;letter-spacing:.09em;
+}
+.stat__value{
+  font-size:30px;font-weight:800;font-family:var(--mono);margin-top:6px;
+  letter-spacing:-.8px;line-height:1.1;
+  background:linear-gradient(135deg,var(--text),var(--text-muted));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat__value.blue{
+  background:linear-gradient(135deg,#818cf8,#6366f1);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat__value.green{
+  background:linear-gradient(135deg,#34d399,#10b981);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat__value.red{
+  background:linear-gradient(135deg,#f87171,#ef4444);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat__value.gray{
+  background:linear-gradient(135deg,#cbd5e1,#94a3b8);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+
+/* ============================================================
+   CHART CARDS
+   ============================================================ */
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px}
+.chart-grid.two{grid-template-columns:repeat(auto-fit,minmax(430px,1fr))}
+
+.chart-card{
+  position:relative;border:1px solid var(--border);border-radius:16px;padding:20px;
+  background:var(--surface-2);backdrop-filter:blur(10px);
+  display:flex;flex-direction:column;gap:6px;
+  transition:all var(--transition);overflow:hidden;
+}
+.chart-card::before{
+  content:"";position:absolute;top:-1px;left:20px;right:20px;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(165,180,252,.5),transparent);
+  opacity:0;transition:opacity var(--transition);
+}
+.chart-card:hover{
+  box-shadow:0 20px 44px -22px rgba(99,102,241,.6);
+  transform:translateY(-2px);
+  border-color:rgba(165,180,252,.35);
+}
+.chart-card:hover::before{opacity:1}
+
+.chart-card__title{
+  font-size:13.5px;font-weight:700;color:var(--text);
+  display:flex;align-items:center;gap:8px;
+}
+.chart-card__desc{font-size:11.5px;color:var(--text-muted);line-height:1.55;margin-bottom:8px}
+.chart-wrap{position:relative;height:280px}
+.chart-wrap.tall{height:400px}
+
+/* ============================================================
+   TABLE
+   ============================================================ */
+.table-wrap{
+  overflow:auto;border:1px solid var(--border);border-radius:14px;
+  background:var(--surface-2);backdrop-filter:blur(10px);
+}
 table.dt{width:100%;border-collapse:collapse;font-size:12.5px;min-width:800px}
-table.dt th,table.dt td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
-table.dt th{background:var(--surface-3);font-weight:700;font-size:11px;text-transform:uppercase;
-  letter-spacing:.06em;color:var(--text-muted);position:sticky;top:0;cursor:pointer;user-select:none}
+table.dt th,table.dt td{padding:10px 13px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+table.dt th{
+  background:linear-gradient(180deg,rgba(99,102,241,.12),rgba(99,102,241,.04));
+  font-weight:700;font-size:11px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--text-muted);
+  position:sticky;top:0;cursor:pointer;user-select:none;
+  backdrop-filter:blur(10px);
+}
 table.dt th:hover{color:var(--blue)}
 table.dt tbody tr{transition:background var(--transition)}
-table.dt tbody tr:hover{background:var(--surface-2)}
+table.dt tbody tr:hover{background:rgba(99,102,241,.07)}
 table.dt td.mono{font-family:var(--mono)}
 
-/* ---------- Filter ---------- */
-.filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
-.filter-field label{display:block;font-size:11px;font-weight:700;color:var(--text-muted);
-  margin-bottom:6px;letter-spacing:.04em;text-transform:uppercase}
-.filter-field input,.filter-field select{width:100%;padding:9px 11px;font-size:12.5px;
-  background:var(--surface);border:1px solid var(--border);border-radius:9px;color:var(--text);
-  transition:all var(--transition)}
-.filter-field input:focus,.filter-field select:focus{outline:none;border-color:var(--blue);
-  box-shadow:0 0 0 3px var(--blue-soft)}
+/* ============================================================
+   FILTER
+   ============================================================ */
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px}
+.filter-field label{
+  display:block;font-size:11px;font-weight:700;color:var(--text-muted);
+  margin-bottom:7px;letter-spacing:.05em;text-transform:uppercase;
+}
+.filter-field input,.filter-field select{
+  width:100%;padding:10px 12px;font-size:12.5px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:10px;
+  color:var(--text);transition:all var(--transition);backdrop-filter:blur(8px);
+}
+.filter-field input:focus,.filter-field select:focus{
+  outline:none;border-color:var(--blue);
+  box-shadow:0 0 0 3px var(--blue-soft), 0 0 20px -8px var(--blue-glow);
+}
 .range-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .chip-group{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
-.chip{padding:6px 11px;font-size:11.5px;font-weight:600;border-radius:999px;
-  border:1px solid var(--border);background:var(--surface);color:var(--text-muted);
-  transition:all var(--transition)}
-.chip:hover{border-color:var(--blue);color:var(--blue)}
-.chip.is-on{background:var(--blue-soft);color:var(--blue);border-color:var(--blue);
-  box-shadow:0 0 0 3px var(--blue-glow)}
+.chip{
+  padding:6px 12px;font-size:11.5px;font-weight:600;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--text-muted);
+  transition:all var(--transition);backdrop-filter:blur(6px);
+}
+.chip:hover{border-color:var(--blue);color:var(--blue);transform:translateY(-1px)}
+.chip.is-on{
+  background:linear-gradient(135deg,#6366f1,#a855f7);
+  color:#fff;border-color:transparent;
+  box-shadow:0 8px 20px -8px rgba(168,85,247,.7);
+}
 
-/* ---------- Buttons ---------- */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 18px;
-  font-size:13px;font-weight:600;border-radius:10px;border:1px solid transparent;
-  transition:all var(--transition)}
+/* ============================================================
+   BUTTONS
+   ============================================================ */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:11px 19px;font-size:13px;font-weight:700;
+  border-radius:11px;border:1px solid transparent;
+  transition:all var(--transition);position:relative;overflow:hidden;
+}
 .btn:active:not(:disabled){transform:translateY(1px)}
 .btn:disabled{opacity:.55;cursor:not-allowed}
-.btn--primary{background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:#fff;
-  box-shadow:0 10px 22px -10px var(--blue-glow)}
-.btn--primary:hover:not(:disabled){filter:brightness(1.05);transform:translateY(-1px)}
-.btn--ghost{background:var(--surface);color:var(--text-muted);border-color:var(--border)}
-.btn--ghost:hover:not(:disabled){border-color:var(--blue);color:var(--blue)}
-.btn--sm{padding:7px 14px;font-size:12px}
 
-/* ---------- Pagination ---------- */
+.btn--primary{
+  background:linear-gradient(135deg,#6366f1 0%,#4f46e5 45%,#7c3aed 100%);
+  color:#fff;
+  box-shadow:0 14px 30px -12px var(--blue-glow), inset 0 1px 0 rgba(255,255,255,.16);
+}
+.btn--primary::before{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.22) 50%,transparent 70%);
+  transform:translateX(-100%);transition:transform .6s ease;
+}
+.btn--primary:hover:not(:disabled){
+  transform:translateY(-1px);
+  box-shadow:0 20px 40px -14px var(--blue-glow), inset 0 1px 0 rgba(255,255,255,.2);
+}
+.btn--primary:hover:not(:disabled)::before{transform:translateX(100%)}
+
+.btn--ghost{
+  background:var(--surface-2);color:var(--text-muted);
+  border-color:var(--border);backdrop-filter:blur(8px);
+}
+.btn--ghost:hover:not(:disabled){
+  border-color:var(--blue);color:var(--blue);
+  box-shadow:0 10px 24px -14px var(--blue-glow);
+}
+.btn--sm{padding:8px 14px;font-size:12px;border-radius:10px}
+
+/* ============================================================
+   PAGINATION
+   ============================================================ */
 .pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  margin-top:12px;flex-wrap:wrap}
+  margin-top:14px;flex-wrap:wrap}
 .pagination__info{font-size:12px;color:var(--text-muted)}
 .pagination__btns{display:flex;gap:6px}
-.pg-btn{padding:7px 13px;font-size:12px;font-weight:600;border-radius:9px;
-  border:1px solid var(--border);background:var(--surface);color:var(--text-muted);
-  transition:all var(--transition)}
-.pg-btn:hover:not(:disabled){border-color:var(--blue);color:var(--blue)}
+.pg-btn{
+  padding:8px 14px;font-size:12px;font-weight:700;border-radius:10px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--text-muted);
+  transition:all var(--transition);backdrop-filter:blur(8px);
+}
+.pg-btn:hover:not(:disabled){
+  border-color:var(--blue);color:var(--blue);
+  box-shadow:0 10px 22px -14px var(--blue-glow);
+}
 .pg-btn:disabled{opacity:.4;cursor:not-allowed}
 
-/* ---------- Wizard ---------- */
-.wizard{display:flex;flex-direction:column;gap:18px}
-.steps{display:flex;justify-content:center;gap:12px;flex-wrap:wrap}
-.step{display:flex;align-items:center;gap:10px;padding:11px 17px;border-radius:999px;
-  border:1px solid var(--border);background:var(--surface-2);font-size:12.5px;
-  font-weight:600;color:var(--text-muted);transition:all var(--transition)}
-.step__num{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
-  background:var(--surface-3);font-size:11px;font-weight:700;color:var(--text-muted)}
-.step.is-active{border-color:var(--blue);color:var(--blue);background:var(--blue-soft);
-  box-shadow:0 0 0 4px var(--blue-glow)}
-.step.is-active .step__num{background:var(--blue);color:#fff}
-.step.is-done{border-color:var(--green);color:var(--green);background:var(--green-soft)}
+/* ============================================================
+   WIZARD
+   ============================================================ */
+.wizard{display:flex;flex-direction:column;gap:22px}
+.steps{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;position:relative}
+.step{
+  display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface-2);
+  font-size:12.5px;font-weight:600;color:var(--text-muted);
+  transition:all var(--transition);backdrop-filter:blur(8px);
+}
+.step__num{
+  width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+  background:var(--surface-3);font-size:11px;font-weight:800;color:var(--text-muted);
+}
+.step.is-active{
+  border-color:transparent;color:#fff;
+  background:linear-gradient(135deg,#6366f1,#7c3aed);
+  box-shadow:0 14px 30px -12px rgba(124,58,237,.75);
+}
+.step.is-active .step__num{background:rgba(255,255,255,.22);color:#fff}
+.step.is-done{
+  border-color:rgba(16,185,129,.5);color:var(--green);
+  background:var(--green-soft);
+}
 .step.is-done .step__num{background:var(--green);color:#fff}
+
 .wizard__body{padding:8px 4px}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-.form-grid .field label{display:block;font-size:11.5px;font-weight:700;color:var(--text-muted);
-  margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
-.form-grid .field input,.form-grid .field select{width:100%;padding:11px 13px;font-size:13.5px;
-  background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);
-  transition:all var(--transition)}
-.form-grid .field input:focus,.form-grid .field select:focus{outline:none;border-color:var(--blue);
-  box-shadow:0 0 0 3px var(--blue-soft)}
-.wizard__nav{display:flex;justify-content:space-between;gap:10px;padding-top:14px;
-  border-top:1px solid var(--border);margin-top:16px}
+.form-grid .field label{
+  display:block;font-size:11.5px;font-weight:700;color:var(--text-muted);
+  margin-bottom:7px;text-transform:uppercase;letter-spacing:.05em;
+}
+.form-grid .field input,.form-grid .field select{
+  width:100%;padding:12px 14px;font-size:13.5px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:11px;
+  color:var(--text);transition:all var(--transition);backdrop-filter:blur(8px);
+}
+.form-grid .field input:focus,.form-grid .field select:focus{
+  outline:none;border-color:var(--blue);
+  box-shadow:0 0 0 3px var(--blue-soft), 0 0 20px -8px var(--blue-glow);
+}
+.wizard__nav{
+  display:flex;justify-content:space-between;gap:10px;
+  padding-top:16px;border-top:1px solid var(--border);margin-top:16px;
+}
 
-.predict-result{border-radius:var(--radius-lg);padding:26px;text-align:center;animation:fadeUp .4s ease}
-@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.predict-result--alive{background:var(--green-soft);border:1px solid var(--green);
-  box-shadow:0 20px 50px -20px rgba(22,163,74,.5)}
-.predict-result--dead{background:var(--red-soft);border:1px solid var(--red);
-  box-shadow:0 20px 50px -20px rgba(220,38,38,.5)}
-.predict-result__icon{font-size:56px;line-height:1;margin-bottom:10px}
-.predict-result__label{font-size:28px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
-.predict-result--alive .predict-result__label{color:var(--green-dark)}
-.predict-result--dead .predict-result__label{color:var(--red-dark)}
-.predict-result__prob{font-size:14px;margin-top:8px;color:var(--text-muted)}
-.predict-result__prob strong{font-size:22px;font-family:var(--mono);color:var(--text);margin-left:6px}
-.predict-meta{margin-top:14px;padding:14px 18px;background:var(--surface-2);
-  border-radius:12px;text-align:left;font-size:12px;color:var(--text-muted);border:1px solid var(--border)}
+/* Prediction result */
+.predict-result{
+  border-radius:20px;padding:30px;text-align:center;
+  animation:fadeUp .5s cubic-bezier(.4,0,.2,1);
+  position:relative;overflow:hidden;
+}
+.predict-result::before{
+  content:"";position:absolute;inset:0;border-radius:20px;padding:1px;
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;
+}
+.predict-result--alive{
+  background:linear-gradient(135deg,rgba(16,185,129,.18),rgba(6,182,212,.12));
+  border:1px solid rgba(16,185,129,.5);
+  box-shadow:0 30px 70px -30px rgba(16,185,129,.7);
+}
+.predict-result--alive::before{background:linear-gradient(135deg,#34d399,#06b6d4)}
+.predict-result--dead{
+  background:linear-gradient(135deg,rgba(239,68,68,.18),rgba(236,72,153,.12));
+  border:1px solid rgba(239,68,68,.5);
+  box-shadow:0 30px 70px -30px rgba(239,68,68,.7);
+}
+.predict-result--dead::before{background:linear-gradient(135deg,#f87171,#ec4899)}
+
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.predict-result__icon{font-size:58px;line-height:1;margin-bottom:12px;
+  filter:drop-shadow(0 8px 20px rgba(0,0,0,.35));
+  animation:iconBounce 2s ease-in-out infinite}
+@keyframes iconBounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+.predict-result__label{font-size:30px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.predict-result--alive .predict-result__label{
+  background:linear-gradient(135deg,#34d399,#06b6d4);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.predict-result--dead .predict-result__label{
+  background:linear-gradient(135deg,#f87171,#ec4899);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.predict-result__prob{font-size:14px;margin-top:10px;color:var(--text-muted)}
+.predict-result__prob strong{
+  font-size:24px;font-family:var(--mono);margin-left:6px;
+  background:linear-gradient(135deg,#a5b4fc,#67e8f9);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.predict-meta{
+  margin-top:16px;padding:16px 20px;background:var(--surface-2);
+  border-radius:14px;text-align:left;font-size:12px;color:var(--text-muted);
+  border:1px solid var(--border);backdrop-filter:blur(10px);
+}
 .predict-meta strong{color:var(--text)}
 
-/* ---------- SVM form ---------- */
-.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;padding:20px 22px}
-.group{border:1px solid var(--border);border-radius:var(--radius);padding:16px;
-  background:var(--surface-2);transition:all var(--transition)}
-.group:hover{border-color:var(--border-strong)}
-.group__title{font-size:11.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--blue);margin-bottom:12px;display:flex;align-items:center;gap:8px}
-.group__title::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--blue);
-  box-shadow:0 0 0 4px var(--blue-glow)}
-.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px}
+/* ============================================================
+   SVM FORM
+   ============================================================ */
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px;padding:22px 24px}
+.group{
+  border:1px solid var(--border);border-radius:16px;padding:18px;
+  background:var(--surface-2);backdrop-filter:blur(10px);
+  transition:all var(--transition);position:relative;overflow:hidden;
+}
+.group::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(165,180,252,.5),transparent);
+  opacity:.6;
+}
+.group:hover{border-color:rgba(165,180,252,.4);
+  box-shadow:0 16px 34px -18px rgba(99,102,241,.55)}
+.group__title{
+  font-size:11.5px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+  margin-bottom:14px;display:flex;align-items:center;gap:8px;
+  background:linear-gradient(90deg,#818cf8,#67e8f9,#f0abfc);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.group__title::before{
+  content:"";width:8px;height:8px;border-radius:50%;
+  background:linear-gradient(135deg,#6366f1,#a855f7);
+  box-shadow:0 0 0 4px rgba(99,102,241,.25), 0 0 12px rgba(168,85,247,.6);
+}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:11px}
 .field label{display:block;font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:5px}
-.field input{width:100%;padding:10px 12px;font-size:13px;font-family:var(--mono);
-  background:var(--surface);border:1px solid var(--border);border-radius:9px;color:var(--text);
-  transition:all var(--transition)}
-.field input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px var(--blue-soft)}
+.field input{
+  width:100%;padding:11px 13px;font-size:13px;font-family:var(--mono);
+  background:rgba(15,23,42,.45);border:1px solid var(--border);border-radius:10px;
+  color:var(--text);transition:all var(--transition);
+}
+[data-theme="light"] .field input{background:rgba(255,255,255,.7)}
+.field input:focus{
+  outline:none;border-color:var(--blue);
+  box-shadow:0 0 0 3px var(--blue-soft), 0 0 20px -8px var(--blue-glow);
+}
 .field input.is-invalid{border-color:var(--red);background:var(--red-soft)}
-.actions{display:flex;gap:10px;flex-wrap:wrap;padding:18px 22px;border-top:1px solid var(--border);
-  background:var(--surface-2)}
-.result__empty{padding:46px 22px;text-align:center;color:var(--text-muted)}
-.result__empty .icon{font-size:46px;opacity:.3;display:block;margin-bottom:12px}
-.result__card{padding:22px}
-.verdict{border-radius:var(--radius-lg);padding:26px 16px;text-align:center;margin-bottom:18px}
-.verdict--malignant{background:var(--red-soft);border:1px solid var(--red);
-  box-shadow:0 20px 50px -20px rgba(220,38,38,.5)}
-.verdict--benign{background:var(--green-soft);border:1px solid var(--green);
-  box-shadow:0 20px 50px -20px rgba(22,163,74,.5)}
-.verdict__icon{font-size:44px;line-height:1;margin-bottom:10px}
-.verdict__label{font-size:22px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
-.verdict--malignant .verdict__label{color:var(--red-dark)}
-.verdict--benign .verdict__label{color:var(--green-dark)}
-.verdict__sub{font-size:12.5px;color:var(--text-muted);margin-top:4px}
-.prob{margin-bottom:16px}
-.prob__head{display:flex;justify-content:space-between;font-size:12px;font-weight:600;margin-bottom:6px}
-.prob__track{height:8px;border-radius:999px;background:var(--surface-3);overflow:hidden}
-.prob__fill{height:100%;border-radius:999px;transition:width .65s cubic-bezier(.2,.9,.3,1.1)}
-.prob__fill--red{background:linear-gradient(90deg,#f87171,var(--red))}
-.prob__fill--green{background:linear-gradient(90deg,#4ade80,var(--green))}
+
+.actions{
+  display:flex;gap:10px;flex-wrap:wrap;padding:20px 24px;
+  border-top:1px solid var(--border);
+  background:linear-gradient(180deg,transparent,rgba(99,102,241,.06));
+}
+
+.result__empty{padding:50px 24px;text-align:center;color:var(--text-muted)}
+.result__empty .icon{
+  font-size:52px;opacity:.35;display:block;margin-bottom:14px;
+  filter:drop-shadow(0 8px 24px rgba(99,102,241,.45));
+}
+.result__card{padding:24px}
+
+.verdict{
+  border-radius:20px;padding:30px 18px;text-align:center;margin-bottom:20px;
+  position:relative;overflow:hidden;
+}
+.verdict::before{
+  content:"";position:absolute;inset:0;border-radius:20px;padding:1px;
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;
+}
+.verdict--malignant{
+  background:linear-gradient(135deg,rgba(239,68,68,.18),rgba(236,72,153,.12));
+  border:1px solid rgba(239,68,68,.45);
+  box-shadow:0 30px 70px -30px rgba(239,68,68,.7);
+}
+.verdict--malignant::before{background:linear-gradient(135deg,#f87171,#ec4899)}
+.verdict--benign{
+  background:linear-gradient(135deg,rgba(16,185,129,.18),rgba(6,182,212,.12));
+  border:1px solid rgba(16,185,129,.45);
+  box-shadow:0 30px 70px -30px rgba(16,185,129,.7);
+}
+.verdict--benign::before{background:linear-gradient(135deg,#34d399,#06b6d4)}
+
+.verdict__icon{font-size:48px;line-height:1;margin-bottom:12px;
+  filter:drop-shadow(0 8px 20px rgba(0,0,0,.35));
+  animation:iconBounce 2s ease-in-out infinite}
+.verdict__label{
+  font-size:24px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;
+}
+.verdict--malignant .verdict__label{
+  background:linear-gradient(135deg,#f87171,#ec4899);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.verdict--benign .verdict__label{
+  background:linear-gradient(135deg,#34d399,#06b6d4);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.verdict__sub{font-size:12.5px;color:var(--text-muted);margin-top:6px;letter-spacing:.04em}
+
+.prob{margin-bottom:18px}
+.prob__head{display:flex;justify-content:space-between;font-size:12px;font-weight:600;margin-bottom:7px}
+.prob__track{
+  height:10px;border-radius:999px;background:var(--surface-3);overflow:hidden;
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.25);
+}
+.prob__fill{
+  height:100%;border-radius:999px;
+  transition:width .8s cubic-bezier(.2,.9,.3,1.1);
+  position:relative;overflow:hidden;
+}
+.prob__fill::after{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);
+  transform:translateX(-100%);
+  animation:probShine 2.5s ease-in-out infinite;
+}
+@keyframes probShine{to{transform:translateX(100%)}}
+.prob__fill--red{background:linear-gradient(90deg,#fb7185,#ef4444,#ec4899);
+  box-shadow:0 0 20px rgba(239,68,68,.5)}
+.prob__fill--green{background:linear-gradient(90deg,#34d399,#10b981,#06b6d4);
+  box-shadow:0 0 20px rgba(16,185,129,.5)}
+
+.meta{
+  background:var(--surface-2);border:1px solid var(--border);border-radius:14px;
+  padding:12px 16px;backdrop-filter:blur(8px);
+}
 .meta__row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;font-size:13px;
   border-bottom:1px dashed var(--border)}
 .meta__row:last-child{border-bottom:none}
 .meta__key{color:var(--text-muted)}
-.meta__val{font-weight:600;font-family:var(--mono)}
-.alert{margin:0;padding:14px 16px;border-radius:var(--radius);
-  background:var(--red-soft);border:1px solid var(--red);color:var(--red-dark);
-  font-size:13px;line-height:1.6}
-.note{margin-top:14px;padding:12px 15px;font-size:11.5px;line-height:1.65;color:var(--text-muted);
-  background:var(--surface-2);border-left:3px solid var(--border-strong);
-  border-radius:0 10px 10px 0}
-.spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;
-  border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+.meta__val{font-weight:700;font-family:var(--mono)}
+
+.alert{
+  margin:0;padding:16px 18px;border-radius:14px;
+  background:var(--red-soft);border:1px solid rgba(239,68,68,.5);
+  color:#fca5a5;font-size:13px;line-height:1.6;
+  box-shadow:0 20px 44px -24px rgba(239,68,68,.7);
+}
+[data-theme="light"] .alert{color:#991b1b}
+
+.note{
+  margin-top:16px;padding:13px 16px;font-size:11.5px;line-height:1.7;
+  color:var(--text-muted);background:var(--surface-2);
+  border-left:3px solid transparent;
+  border-image:linear-gradient(180deg,#818cf8,#67e8f9) 1;
+  border-radius:0 10px 10px 0;
+  backdrop-filter:blur(8px);
+}
+.spinner{
+  width:14px;height:14px;border:2px solid rgba(255,255,255,.35);
+  border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;
+  display:inline-block;
+}
 @keyframes spin{to{transform:rotate(360deg)}}
-.footer{text-align:center;font-size:12px;color:var(--text-muted);padding-top:8px}
+.footer{
+  text-align:center;font-size:12px;color:var(--text-muted);padding-top:10px;
+  letter-spacing:.04em;
+}
 .muted{color:var(--text-muted);font-size:12.5px}
 
-/* ---------- Toast ---------- */
-.toast-stack{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px}
-.toast{padding:12px 16px;border-radius:11px;background:var(--surface);
-  border:1px solid var(--border);box-shadow:var(--shadow-lg);font-size:13px;
-  display:flex;align-items:flex-start;gap:10px;max-width:340px;animation:slideIn .3s ease}
-.toast--ok{border-color:var(--green);background:var(--green-soft);color:var(--green-dark)}
-.toast--err{border-color:var(--red);background:var(--red-soft);color:var(--red-dark)}
-.toast--info{border-color:var(--blue);background:var(--blue-soft);color:var(--blue-dark)}
-@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+/* ============================================================
+   TOAST
+   ============================================================ */
+.toast-stack{position:fixed;top:22px;right:22px;z-index:9999;
+  display:flex;flex-direction:column;gap:10px;pointer-events:none}
+.toast{
+  padding:14px 18px;border-radius:14px;
+  background:var(--surface);backdrop-filter:blur(20px) saturate(160%);
+  border:1px solid var(--border);box-shadow:var(--shadow-lg);
+  font-size:13px;display:flex;align-items:flex-start;gap:10px;
+  max-width:360px;animation:slideIn .35s cubic-bezier(.4,0,.2,1);
+  pointer-events:auto;position:relative;overflow:hidden;
+}
+.toast::before{
+  content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+  border-radius:14px 0 0 14px;
+}
+.toast--ok{border-color:rgba(16,185,129,.5)}
+.toast--ok::before{background:linear-gradient(180deg,#34d399,#10b981)}
+.toast--err{border-color:rgba(239,68,68,.5)}
+.toast--err::before{background:linear-gradient(180deg,#f87171,#ef4444)}
+.toast--info{border-color:rgba(99,102,241,.5)}
+.toast--info::before{background:linear-gradient(180deg,#818cf8,#6366f1)}
+@keyframes slideIn{from{opacity:0;transform:translateX(28px)}to{opacity:1;transform:none}}
 
-/* ---------- Skeleton ---------- */
-.skeleton{background:linear-gradient(90deg,var(--surface-3) 25%,var(--surface-2) 50%,var(--surface-3) 75%);
-  background-size:200% 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:8px}
+/* ============================================================
+   SKELETON
+   ============================================================ */
+.skeleton{
+  background:linear-gradient(90deg,var(--surface-3) 25%,var(--surface-2) 50%,var(--surface-3) 75%);
+  background-size:200% 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:8px;
+}
 @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
 
-/* ---------- Responsive ---------- */
-@media (max-width:640px){
-  .header{padding:18px 18px}
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width:768px){
+  body{padding:14px 10px 40px}
+  .header{padding:20px 18px;border-radius:18px}
   .header__title{font-size:20px}
   .stat__value{font-size:24px}
   .panel__body{padding:16px}
+  .stat__icon{width:36px;height:36px;font-size:16px}
+  .tabs{padding:5px;border-radius:14px}
+  .tab{padding:9px 12px;font-size:11.5px}
+  .chart-wrap{height:230px}
+  .chart-wrap.tall{height:300px}
+  .header__actions{gap:8px}
+  .user-chip{display:none}
 }
 </style>
 </head>
 
 <body>
+<div class="orb-field"><span></span><span></span><span></span><span></span></div>
+
 <div class="app">
 
   <!-- ============== HEADER ============== -->
@@ -1932,7 +2387,7 @@ table.dt td.mono{font-family:var(--mono)}
         <span class="user-chip__av" id="userAv">U</span>
         <span id="userName">user</span>
       </span>
-      <button class="theme-btn" id="btnTheme" type="button" title="Đổi sáng/tối">🌙</button>
+      <button class="theme-btn" id="btnTheme" type="button" title="Đổi sáng/tối">☀️</button>
       <button class="logout-btn" id="btnLogout" type="button">Đăng xuất</button>
     </div>
   </header>
@@ -1965,14 +2420,14 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Tình trạng sống: Alive / Dead</div>
+        <div class="chart-card__title">🌡️ Tình trạng sống: Alive / Dead</div>
         <div class="chart-card__desc">
           Biểu đồ cho thấy tỉ lệ bệnh nhân còn sống và đã tử vong trong toàn bộ dữ liệu.
         </div>
         <div class="chart-wrap"><canvas id="ovStatus"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Phân bố các giai đoạn bệnh</div>
+        <div class="chart-card__title">📊 Phân bố các giai đoạn bệnh</div>
         <div class="chart-card__desc">
           Số lượng bệnh nhân được chẩn đoán ở từng giai đoạn (6th Stage) — giúp thấy được
           bức tranh tổng thể về mức độ phát hiện bệnh.
@@ -2031,7 +2486,7 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Phân bố độ tuổi</div>
+        <div class="chart-card__title">🎂 Phân bố độ tuổi</div>
         <div class="chart-card__desc">
           Histogram cho thấy độ tuổi tập trung chủ yếu ở nhóm nào; giúp nhận diện
           nhóm tuổi có nguy cơ cao nhất.
@@ -2039,7 +2494,7 @@ table.dt td.mono{font-family:var(--mono)}
         <div class="chart-wrap"><canvas id="ptAge"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Chủng tộc (Race)</div>
+        <div class="chart-card__title">🌍 Chủng tộc (Race)</div>
         <div class="chart-card__desc">
           Số lượng bệnh nhân theo từng nhóm chủng tộc trong tập dữ liệu.
         </div>
@@ -2048,7 +2503,7 @@ table.dt td.mono{font-family:var(--mono)}
     </div>
 
     <div class="chart-card">
-      <div class="chart-card__title">Tình trạng hôn nhân</div>
+      <div class="chart-card__title">💍 Tình trạng hôn nhân</div>
       <div class="chart-card__desc">
         Phân bố bệnh nhân theo tình trạng hôn nhân (Married / Single / Divorced / Widowed / Separated).
       </div>
@@ -2070,28 +2525,28 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Giai đoạn bệnh (6th Stage)</div>
+        <div class="chart-card__title">📈 Giai đoạn bệnh (6th Stage)</div>
         <div class="chart-card__desc">
           Phân bố bệnh nhân theo giai đoạn bệnh — giai đoạn càng cao thì tiên lượng càng nặng.
         </div>
         <div class="chart-wrap"><canvas id="disStage"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Kích thước khối u (mm)</div>
+        <div class="chart-card__title">📏 Kích thước khối u (mm)</div>
         <div class="chart-card__desc">
           Histogram kích thước khối u giúp nhận diện khối u thường được phát hiện ở kích cỡ nào.
         </div>
         <div class="chart-wrap"><canvas id="disSize"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Grade (mức độ ác tính)</div>
+        <div class="chart-card__title">⚗️ Grade (mức độ ác tính)</div>
         <div class="chart-card__desc">
           Phân bố mức độ biệt hoá tế bào — grade càng cao, tế bào càng kém biệt hoá.
         </div>
         <div class="chart-wrap"><canvas id="disGrade"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Differentiate (biệt hoá)</div>
+        <div class="chart-card__title">🔬 Differentiate (biệt hoá)</div>
         <div class="chart-card__desc">
           Mức độ biệt hoá của tế bào u: từ Well → Moderately → Poorly → Undifferentiated.
         </div>
@@ -2114,14 +2569,14 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Estrogen Status</div>
+        <div class="chart-card__title">💗 Estrogen Status</div>
         <div class="chart-card__desc">
           Tỉ lệ bệnh nhân dương tính / âm tính với thụ thể Estrogen.
         </div>
         <div class="chart-wrap"><canvas id="bioEst"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Progesterone Status</div>
+        <div class="chart-card__title">💜 Progesterone Status</div>
         <div class="chart-card__desc">
           Tỉ lệ bệnh nhân dương tính / âm tính với thụ thể Progesterone.
         </div>
@@ -2130,7 +2585,7 @@ table.dt td.mono{font-family:var(--mono)}
     </div>
 
     <div class="chart-card">
-      <div class="chart-card__title">Phân tích hạch bạch huyết</div>
+      <div class="chart-card__title">🕸️ Phân tích hạch bạch huyết</div>
       <div class="chart-card__desc">
         Số hạch bạch huyết dương tính (regional node positive) — chỉ số quan trọng
         phản ánh mức độ lan rộng của bệnh.
@@ -2153,14 +2608,14 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Phân bố thời gian sống</div>
+        <div class="chart-card__title">📉 Phân bố thời gian sống</div>
         <div class="chart-card__desc">
           Histogram thời gian sống (tháng) — cho biết phần lớn bệnh nhân sống được bao lâu.
         </div>
         <div class="chart-wrap"><canvas id="svHist"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Thời gian sống theo giai đoạn bệnh</div>
+        <div class="chart-card__title">📦 Thời gian sống theo giai đoạn bệnh</div>
         <div class="chart-card__desc">
           Biểu đồ cho thấy sự phân bố thời gian sống ở các giai đoạn bệnh khác nhau.
         </div>
@@ -2170,7 +2625,7 @@ table.dt td.mono{font-family:var(--mono)}
 
     <div class="chart-grid two">
       <div class="chart-card">
-        <div class="chart-card__title">Kích thước khối u vs Thời gian sống</div>
+        <div class="chart-card__title">🔵 Kích thước khối u vs Thời gian sống</div>
         <div class="chart-card__desc">
           Mỗi điểm là một bệnh nhân. Xu hướng giảm cho thấy khối u lớn hơn đi kèm
           thời gian sống ngắn hơn.
@@ -2178,7 +2633,7 @@ table.dt td.mono{font-family:var(--mono)}
         <div class="chart-wrap"><canvas id="svScatterTumor"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-card__title">Số hạch dương tính vs Thời gian sống</div>
+        <div class="chart-card__title">🟣 Số hạch dương tính vs Thời gian sống</div>
         <div class="chart-card__desc">
           Bệnh nhân có nhiều hạch dương tính thường có thời gian sống ngắn hơn.
         </div>
@@ -2187,13 +2642,13 @@ table.dt td.mono{font-family:var(--mono)}
     </div>
 
     <div class="panel">
-      <div class="panel__head"><h2>Ma trận tương quan</h2></div>
+      <div class="panel__head"><h2>🌈 Ma trận tương quan</h2></div>
       <div class="panel__body">
-        <p class="muted" style="margin-bottom:10px">
+        <p class="muted" style="margin-bottom:12px">
           Giá trị càng gần 1 (xanh) hoặc -1 (đỏ) thì mức tương quan giữa hai biến càng mạnh.
           Ô màu đậm hơn thể hiện tương quan mạnh hơn.
         </p>
-        <div class="chart-card" style="padding:8px">
+        <div class="chart-card" style="padding:10px">
           <div class="chart-wrap tall"><canvas id="svCorr"></canvas></div>
         </div>
       </div>
@@ -2308,21 +2763,36 @@ table.dt td.mono{font-family:var(--mono)}
     </aside>
   </section>
 
-  <p class="footer">Demo học thuật · Không thay thế chẩn đoán y khoa</p>
+  <p class="footer">✨ Demo học thuật · Không thay thế chẩn đoán y khoa</p>
 </div>
 
 <div class="toast-stack" id="toastStack"></div>
 
 <script>
 /* ============================================================
-   PALETTE
+   PALETTE — mở rộng với gradient rực rỡ
    ============================================================ */
 const CLR = {
-  blue:  "#2563eb", green: "#16a34a", red: "#dc2626", gray: "#94a3b8",
-  blueSoft:  "rgba(37,99,235,.65)",
-  greenSoft: "rgba(22,163,74,.75)",
-  redSoft:   "rgba(220,38,38,.75)",
+  blue:  "#6366f1", green: "#10b981", red: "#ef4444", gray: "#94a3b8",
+  cyan:  "#06b6d4", purple: "#a855f7", pink: "#ec4899", amber: "#f59e0b",
+  blueSoft:  "rgba(99,102,241,.7)",
+  greenSoft: "rgba(16,185,129,.78)",
+  redSoft:   "rgba(239,68,68,.78)",
   graySoft:  "rgba(148,163,184,.7)",
+  cyanSoft:  "rgba(6,182,212,.75)",
+  purpleSoft:"rgba(168,85,247,.75)",
+  amberSoft: "rgba(245,158,11,.75)",
+  pinkSoft:  "rgba(236,72,153,.75)",
+};
+
+const GRADIENTS = {
+  blue:   ["#818cf8","#6366f1"],
+  green:  ["#34d399","#10b981"],
+  red:    ["#f87171","#ef4444"],
+  cyan:   ["#22d3ee","#06b6d4"],
+  purple: ["#c084fc","#a855f7"],
+  pink:   ["#f472b6","#ec4899"],
+  amber:  ["#fbbf24","#f59e0b"],
 };
 
 /* ============================================================
@@ -2436,7 +2906,7 @@ const Api = (() => {
 })();
 
 /* ============================================================
-   CHART REGISTRY
+   CHART REGISTRY — với gradient helpers
    ============================================================ */
 const Charts = (() => {
   const registry = {};
@@ -2449,16 +2919,30 @@ const Charts = (() => {
     const el = document.getElementById(id);
     if (!el) return null;
     destroy(id);
+    // Tự động bật gradient nếu dataset có backgroundColor dạng chuỗi gradient key
     registry[id] = new Chart(el.getContext("2d"), cfg);
     return registry[id];
   }
   function baseOpts() {
     return {
       responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{labels:{color:textColor(), font:{family:"Plus Jakarta Sans", size:11}}} },
+      plugins:{
+        legend:{labels:{color:textColor(), font:{family:"Plus Jakarta Sans", size:11, weight:"600"},
+          boxWidth:10, boxHeight:10, usePointStyle:true, pointStyle:"circle", padding:14}},
+        tooltip:{
+          backgroundColor:"rgba(15,23,42,.92)",
+          borderColor:"rgba(99,102,241,.4)",
+          borderWidth:1,
+          titleColor:"#f1f5f9",
+          bodyColor:"#e2e8f0",
+          padding:12,
+          cornerRadius:10,
+          boxPadding:6,
+        }
+      },
       scales:{
-        x:{ticks:{color:textColor(), font:{size:10}}, grid:{color:gridColor()}},
-        y:{ticks:{color:textColor(), font:{size:10}}, grid:{color:gridColor()}, beginAtZero:true}
+        x:{ticks:{color:textColor(), font:{size:10}}, grid:{color:gridColor(), drawBorder:false}},
+        y:{ticks:{color:textColor(), font:{size:10}}, grid:{color:gridColor(), drawBorder:false}, beginAtZero:true}
       }
     };
   }
@@ -2655,39 +3139,61 @@ const Dashboard = (() => {
       const d = await Api.overview();
       $("ovStats").innerHTML =
         statCard("👥", "Tổng bệnh nhân", d.rows, "blue") +
-        statCard("🟢", "Alive", d.alive, "green") +
-        statCard("🔴", "Dead", d.dead, "red") +
-        statCard("📈", "Thời gian sống TB", num(d.avg_survival, 1) + " th", "gray");
+        statCard("💚", "Alive", d.alive, "green") +
+        statCard("❤️", "Dead", d.dead, "red") +
+        statCard("⏳", "Thời gian sống TB", num(d.avg_survival, 1) + " th", "gray");
 
+      // Doughnut với gradient rực rỡ
       Charts.make("ovStatus", {
         type:"doughnut",
         data:{
           labels:["Alive","Dead"],
           datasets:[{data:[d.alive, d.dead],
-            backgroundColor:[CLR.green, CLR.red], borderWidth:0,
-            hoverOffset:6}]
+            backgroundColor:[CLR.green, CLR.red],
+            hoverBackgroundColor:["#34d399","#f87171"],
+            borderWidth:0, borderColor:"transparent",
+            hoverOffset:10, spacing:2}]
         },
-        options:{responsive:true, maintainAspectRatio:false, cutout:"64%",
+        options:{responsive:true, maintainAspectRatio:false, cutout:"66%",
           plugins:{
-            legend:{position:"bottom", labels:{color:Charts.textColor(), padding:14}},
-            tooltip:{callbacks:{
-              label:(c) => {
-                const total = d.alive + d.dead;
-                const pct = total ? ((c.raw/total)*100).toFixed(1) : "0";
-                return `${c.label}: ${c.raw} (${pct}%)`;
+            legend:{position:"bottom", labels:{color:Charts.textColor(), padding:16,
+              font:{family:"Plus Jakarta Sans", size:12, weight:"600"},
+              usePointStyle:true, pointStyle:"circle", boxWidth:9, boxHeight:9}},
+            tooltip:{
+              backgroundColor:"rgba(15,23,42,.92)", padding:12, cornerRadius:10,
+              borderColor:"rgba(16,185,129,.4)", borderWidth:1,
+              callbacks:{
+                label:(c) => {
+                  const total = d.alive + d.dead;
+                  const pct = total ? ((c.raw/total)*100).toFixed(1) : "0";
+                  return ` ${c.label}: ${c.raw} (${pct}%)`;
+                }
               }
-            }}
+            }
           }
         }
       });
 
       const stageKeys = Object.keys(d.stage_distribution || {}).sort();
+      // Gradient background cho bar
+      const ctx = document.getElementById("ovStage")?.getContext("2d");
+      let grad = CLR.blue;
+      if (ctx) {
+        grad = ctx.createLinearGradient(0, 0, 0, 280);
+        grad.addColorStop(0, "#a5b4fc");
+        grad.addColorStop(0.5, "#6366f1");
+        grad.addColorStop(1, "#4f46e5");
+      }
       Charts.make("ovStage", {
         type:"bar",
         data:{labels: stageKeys,
           datasets:[{label:"Số bệnh nhân",
             data: stageKeys.map(k => d.stage_distribution[k]),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor: grad,
+            hoverBackgroundColor:"#818cf8",
+            borderRadius:8,
+            borderSkipped:false,
+            maxBarThickness:54}]},
         options:Charts.baseOpts()
       });
     } catch(e) { $("ovStats").innerHTML = `<div class="alert">${e.message}</div>`; }
@@ -2795,27 +3301,42 @@ const Dashboard = (() => {
         statCard("⬇️","Tuổi thấp nhất", num(d.age_stats.min, 0), "gray") +
         statCard("⬆️","Tuổi cao nhất", num(d.age_stats.max, 0), "gray");
 
+      // Bar với gradient cyan→blue
+      const c1 = document.getElementById("ptAge")?.getContext("2d");
+      let g1 = CLR.blue;
+      if (c1) { g1 = c1.createLinearGradient(0,0,0,280);
+        g1.addColorStop(0,"#67e8f9"); g1.addColorStop(1,"#06b6d4"); }
       Charts.make("ptAge", {
         type:"bar",
         data:{labels:Object.keys(d.age_hist),
           datasets:[{label:"Số bệnh nhân", data:Object.values(d.age_hist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:g1, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
         options:Charts.baseOpts()
       });
 
+      // Bar purple
+      const c2 = document.getElementById("ptRace")?.getContext("2d");
+      let g2 = CLR.purple;
+      if (c2) { g2 = c2.createLinearGradient(0,0,0,280);
+        g2.addColorStop(0,"#c084fc"); g2.addColorStop(1,"#a855f7"); }
       Charts.make("ptRace", {
         type:"bar",
         data:{labels:Object.keys(d.race_dist),
           datasets:[{label:"Số bệnh nhân", data:Object.values(d.race_dist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:g2, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
         options:Charts.baseOpts()
       });
 
+      // Horizontal pink→purple
+      const c3 = document.getElementById("ptMarital")?.getContext("2d");
+      let g3 = CLR.pink;
+      if (c3) { g3 = c3.createLinearGradient(0,0,400,0);
+        g3.addColorStop(0,"#f472b6"); g3.addColorStop(1,"#a855f7"); }
       Charts.make("ptMarital", {
         type:"bar",
         data:{labels:Object.keys(d.marital_dist),
           datasets:[{label:"Số bệnh nhân", data:Object.values(d.marital_dist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:g3, borderRadius:8, borderSkipped:false, maxBarThickness:32}]},
         options:{...Charts.baseOpts(), indexAxis:"y"}
       });
     } catch(e) { $("ptStats").innerHTML = `<div class="alert">${e.message}</div>`; }
@@ -2831,32 +3352,51 @@ const Dashboard = (() => {
         statCard("⬇️","Min", num(d.size_stats.min, 0), "gray") +
         statCard("⬆️","Max", num(d.size_stats.max, 0), "gray");
 
+      const cStage = document.getElementById("disStage")?.getContext("2d");
+      let gs = CLR.purple;
+      if (cStage) { gs = cStage.createLinearGradient(0,0,0,280);
+        gs.addColorStop(0,"#c084fc"); gs.addColorStop(1,"#7c3aed"); }
       Charts.make("disStage", {
         type:"bar",
         data:{labels:Object.keys(d.stage_dist),
           datasets:[{label:"Số ca", data:Object.values(d.stage_dist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gs, borderRadius:8, borderSkipped:false, maxBarThickness:54}]},
         options:Charts.baseOpts()
       });
+
+      const cSize = document.getElementById("disSize")?.getContext("2d");
+      let gSz = CLR.cyan;
+      if (cSize) { gSz = cSize.createLinearGradient(0,0,0,280);
+        gSz.addColorStop(0,"#67e8f9"); gSz.addColorStop(1,"#0891b2"); }
       Charts.make("disSize", {
         type:"bar",
         data:{labels:Object.keys(d.size_hist),
           datasets:[{label:"Số ca", data:Object.values(d.size_hist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gSz, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
         options:Charts.baseOpts()
       });
+
+      const cGrade = document.getElementById("disGrade")?.getContext("2d");
+      let gG = CLR.amber;
+      if (cGrade) { gG = cGrade.createLinearGradient(0,0,0,280);
+        gG.addColorStop(0,"#fbbf24"); gG.addColorStop(1,"#ea580c"); }
       Charts.make("disGrade", {
         type:"bar",
         data:{labels:Object.keys(d.grade_dist),
           datasets:[{label:"Số ca", data:Object.values(d.grade_dist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gG, borderRadius:8, borderSkipped:false, maxBarThickness:54}]},
         options:Charts.baseOpts()
       });
+
+      const cDiff = document.getElementById("disDiff")?.getContext("2d");
+      let gD = CLR.pink;
+      if (cDiff) { gD = cDiff.createLinearGradient(0,0,400,0);
+        gD.addColorStop(0,"#f472b6"); gD.addColorStop(1,"#db2777"); }
       Charts.make("disDiff", {
         type:"bar",
         data:{labels:Object.keys(d.differentiate_dist),
           datasets:[{label:"Số ca", data:Object.values(d.differentiate_dist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gD, borderRadius:8, borderSkipped:false, maxBarThickness:30}]},
         options:{...Charts.baseOpts(), indexAxis:"y"}
       });
     } catch(e) { $("disStats").innerHTML = `<div class="alert">${e.message}</div>`; }
@@ -2876,9 +3416,10 @@ const Dashboard = (() => {
       Charts.make("bioEst", {
         type:"doughnut",
         data:{labels:estLabels, datasets:[{data:Object.values(d.estrogen_dist),
-          backgroundColor:estColors, borderWidth:0, hoverOffset:6}]},
-        options:{responsive:true, maintainAspectRatio:false, cutout:"64%",
-          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor()}}}}
+          backgroundColor:estColors, borderWidth:0, hoverOffset:10, spacing:2}]},
+        options:{responsive:true, maintainAspectRatio:false, cutout:"66%",
+          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor(),
+            padding:14, usePointStyle:true, pointStyle:"circle", boxWidth:9, boxHeight:9}}}}
       });
 
       const progLabels = Object.keys(d.progesterone_dist);
@@ -2886,16 +3427,21 @@ const Dashboard = (() => {
       Charts.make("bioProg", {
         type:"doughnut",
         data:{labels:progLabels, datasets:[{data:Object.values(d.progesterone_dist),
-          backgroundColor:progColors, borderWidth:0, hoverOffset:6}]},
-        options:{responsive:true, maintainAspectRatio:false, cutout:"64%",
-          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor()}}}}
+          backgroundColor:progColors, borderWidth:0, hoverOffset:10, spacing:2}]},
+        options:{responsive:true, maintainAspectRatio:false, cutout:"66%",
+          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor(),
+            padding:14, usePointStyle:true, pointStyle:"circle", boxWidth:9, boxHeight:9}}}}
       });
 
+      const cNode = document.getElementById("bioNode")?.getContext("2d");
+      let gN = CLR.cyan;
+      if (cNode) { gN = cNode.createLinearGradient(0,0,0,280);
+        gN.addColorStop(0,"#22d3ee"); gN.addColorStop(1,"#7c3aed"); }
       Charts.make("bioNode", {
         type:"bar",
         data:{labels:Object.keys(d.node_hist),
           datasets:[{label:"Số ca", data:Object.values(d.node_hist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gN, borderRadius:8, borderSkipped:false, maxBarThickness:54}]},
         options:Charts.baseOpts()
       });
     } catch(e) { $("bioStats").innerHTML = `<div class="alert">${e.message}</div>`; }
@@ -2911,11 +3457,15 @@ const Dashboard = (() => {
         statCard("⬇️","Min", num(d.survival_stats.min, 0), "gray") +
         statCard("⬆️","Max", num(d.survival_stats.max, 0), "gray");
 
+      const cH = document.getElementById("svHist")?.getContext("2d");
+      let gH = CLR.blue;
+      if (cH) { gH = cH.createLinearGradient(0,0,0,280);
+        gH.addColorStop(0,"#a5b4fc"); gH.addColorStop(1,"#6366f1"); }
       Charts.make("svHist", {
         type:"bar",
         data:{labels:Object.keys(d.survival_hist),
           datasets:[{label:"Số ca", data:Object.values(d.survival_hist),
-            backgroundColor:CLR.blue, borderRadius:6}]},
+            backgroundColor:gH, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
         options:Charts.baseOpts()
       });
 
@@ -2930,14 +3480,16 @@ const Dashboard = (() => {
           type:"boxplot",
           data:{labels: stages,
             datasets:[{label:"Thời gian sống (tháng)", data: boxes,
-              backgroundColor: CLR.blueSoft, borderColor: CLR.blue,
-              borderWidth: 1.5, medianColor: CLR.blue,
-              itemRadius: 0, outlierRadius: 2, outlierBackgroundColor: CLR.red}]},
+              backgroundColor: "rgba(168,85,247,.55)",
+              borderColor: "#a855f7",
+              borderWidth: 2, medianColor: "#f0abfc",
+              itemRadius: 0, outlierRadius: 2, outlierBackgroundColor: "#ec4899"}]},
           options:{responsive:true, maintainAspectRatio:false,
-            plugins:{legend:{display:false}},
+            plugins:{legend:{display:false},
+              tooltip:{backgroundColor:"rgba(15,23,42,.92)", padding:12, cornerRadius:10}},
             scales:{
-              x:{ticks:{color:Charts.textColor()}, grid:{color:Charts.gridColor()}},
-              y:{ticks:{color:Charts.textColor()}, grid:{color:Charts.gridColor()}, beginAtZero:true}
+              x:{ticks:{color:Charts.textColor()}, grid:{color:Charts.gridColor(), drawBorder:false}},
+              y:{ticks:{color:Charts.textColor()}, grid:{color:Charts.gridColor(), drawBorder:false}, beginAtZero:true}
             }}
         });
       }
@@ -2949,11 +3501,15 @@ const Dashboard = (() => {
         type:"scatter",
         data:{datasets:[
           {label:"Alive", data:aliveT.map(p => ({x:p.x, y:p.y})),
-           backgroundColor:CLR.greenSoft, pointRadius:3},
+           backgroundColor:"rgba(16,185,129,.55)", pointRadius:3.5,
+           pointHoverRadius:6, borderColor:"rgba(16,185,129,.9)", borderWidth:1},
           {label:"Dead", data:deadT.map(p => ({x:p.x, y:p.y})),
-           backgroundColor:CLR.redSoft, pointRadius:3},
+           backgroundColor:"rgba(239,68,68,.55)", pointRadius:3.5,
+           pointHoverRadius:6, borderColor:"rgba(239,68,68,.9)", borderWidth:1},
         ]},
-        options:{...Charts.baseOpts(), plugins:{legend:{labels:{color:Charts.textColor()}}}}
+        options:{...Charts.baseOpts(), plugins:{
+          legend:{labels:{color:Charts.textColor(), usePointStyle:true, pointStyle:"circle"}}
+        }}
       });
 
       const scN = d.scatter_node_survival || [];
@@ -2963,9 +3519,11 @@ const Dashboard = (() => {
         type:"scatter",
         data:{datasets:[
           {label:"Alive", data:aliveN.map(p => ({x:p.x, y:p.y})),
-           backgroundColor:CLR.greenSoft, pointRadius:3},
+           backgroundColor:"rgba(6,182,212,.6)", pointRadius:3.5,
+           pointHoverRadius:6, borderColor:"rgba(6,182,212,.95)", borderWidth:1},
           {label:"Dead", data:deadN.map(p => ({x:p.x, y:p.y})),
-           backgroundColor:CLR.redSoft, pointRadius:3},
+           backgroundColor:"rgba(236,72,153,.6)", pointRadius:3.5,
+           pointHoverRadius:6, borderColor:"rgba(236,72,153,.95)", borderWidth:1},
         ]},
         options:{...Charts.baseOpts()}
       });
@@ -2985,10 +3543,23 @@ const Dashboard = (() => {
             type:"matrix",
             data:{datasets:[{
               data:pts,
+              // Gradient theo dải giá trị: đỏ ↔ tím ↔ xanh
               backgroundColor:(c) => {
-                const v = c.raw?.v ?? 0; const a = Math.min(1, Math.abs(v));
-                return v >= 0 ? `rgba(37,99,235,${0.15 + 0.75*a})`
-                              : `rgba(220,38,38,${0.15 + 0.75*a})`;
+                const v = c.raw?.v ?? 0;
+                const a = Math.min(1, Math.abs(v));
+                if (v >= 0) {
+                  // Từ xanh lá (yếu) → cyan → indigo (mạnh)
+                  const r = Math.round(16  + (99-16)  * a);
+                  const g = Math.round(185 + (102-185)* a);
+                  const b = Math.round(129 + (241-129)* a);
+                  return `rgba(${r},${g},${b},${0.2 + 0.75*a})`;
+                } else {
+                  // Đỏ → hồng → tím
+                  const r = Math.round(239 + (236-239)* a);
+                  const g = Math.round(68  + (72-68)  * a);
+                  const b = Math.round(68  + (153-68)* a);
+                  return `rgba(${r},${g},${b},${0.2 + 0.75*a})`;
+                }
               },
               width:({chart}) => ((chart.chartArea||{width:400}).width / cols.length) - 2,
               height:({chart}) => ((chart.chartArea||{height:400}).height / cols.length) - 2,
@@ -2997,16 +3568,19 @@ const Dashboard = (() => {
               responsive:true, maintainAspectRatio:false,
               plugins:{
                 legend:{display:false},
-                tooltip:{callbacks:{
-                  title:()=> "",
-                  label:(c) => `${c.raw.y} × ${c.raw.x}: ${c.raw.v}`
-                }}
+                tooltip:{
+                  backgroundColor:"rgba(15,23,42,.92)", padding:12, cornerRadius:10,
+                  callbacks:{
+                    title:()=> "",
+                    label:(c) => `${c.raw.y} × ${c.raw.x}: ${c.raw.v}`
+                  }
+                }
               },
               scales:{
                 x:{type:"category", labels:cols,
-                   ticks:{color:Charts.textColor(), font:{size:9}}},
+                   ticks:{color:Charts.textColor(), font:{size:9}}, grid:{display:false}},
                 y:{type:"category", labels:cols,
-                   ticks:{color:Charts.textColor(), font:{size:9}}}
+                   ticks:{color:Charts.textColor(), font:{size:9}}, grid:{display:false}}
               }
             }
           });
@@ -3118,7 +3692,7 @@ const Wizard = (() => {
           <p>Mô hình sử dụng: <strong>${d.model}</strong></p>
           <p>P(Alive) = <strong>${(d.probability_alive*100).toFixed(1)}%</strong> ·
              P(Dead) = <strong>${(d.probability_dead*100).toFixed(1)}%</strong></p>
-          <p style="margin-top:6px;color:var(--text-soft)">
+          <p style="margin-top:8px;color:var(--text-soft)">
             Kết quả chỉ mang tính tham khảo, không thay thế kết luận của bác sĩ.
           </p>
         </div>`;
@@ -3192,8 +3766,8 @@ const App = (() => {
   }
 
   function init() {
-    let saved = "light";
-    try { saved = localStorage.getItem("bc-theme") || "light"; } catch {}
+    let saved = "dark";
+    try { saved = localStorage.getItem("bc-theme") || "dark"; } catch {}
     UI.applyTheme(saved);
 
     UI.buildForm();
