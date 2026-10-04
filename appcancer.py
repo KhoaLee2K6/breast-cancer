@@ -605,12 +605,18 @@ class PatientInput(BaseModel):
     model: str = "Random Forest"
 
 
-# 🆕 NEW SCHEMA — Group comparison
+# NEW SCHEMA — Group comparison
 class ComparePayload(BaseModel):
     filters: Optional[Dict[str, Any]] = None
     group_by: str = "stage_6th"
     group_a: str
     group_b: str
+
+
+# NEW SCHEMA — Kaplan-Meier
+class KaplanMeierPayload(BaseModel):
+    filters: Optional[Dict[str, Any]] = None
+    group_by: str = "stage_6th"
 
 
 class LoginPayload(BaseModel):
@@ -634,7 +640,7 @@ CLASS_LABELS = ["malignant", "benign"]
 app = FastAPI(
     title="Breast Cancer Analytics API",
     description="Dashboard phân tích sống còn + SVM chẩn đoán 30 đặc trưng. Có bảo mật SQL.",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 app.add_middleware(
@@ -745,18 +751,13 @@ def api_register(payload: RegisterPayload, request: Request, response: Response)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi tạo tài khoản: {exc}")
 
-    result = authenticate(payload.username, payload.password, ip, ua)
-    if not result["ok"]:
-        return {"ok": True, "user": None, "message": "Đăng ký thành công, hãy đăng nhập."}
-
-    user = result["user"]
-    token = create_session(user["id"], ip, ua)
-    response.set_cookie(
-        key=SESSION_COOKIE, value=token,
-        max_age=SESSION_TTL_HOURS * 3600,
-        httponly=True, samesite="lax", secure=False, path="/",
-    )
-    return {"ok": True, "user": user}
+    # KHÔNG tự động đăng nhập — yêu cầu user đăng nhập lại
+    audit_log(payload.username, ip, ua, False, "registered_pending_login")
+    return {
+        "ok": True,
+        "user": None,
+        "message": "Đăng ký thành công. Vui lòng đăng nhập để tiếp tục.",
+    }
 
 
 @app.post("/api/auth/logout")
@@ -1115,118 +1116,95 @@ def api_survival(payload: FilterPayload):
 
 
 # ==============================================================
-# 🆕 3e. RISK ANALYSIS — Phân tích nguy cơ
+# 3e. KAPLAN-MEIER SURVIVAL CURVE
 # ==============================================================
-@app.post("/api/analysis/risk")
-def api_risk(payload: FilterPayload):
+def _kaplan_meier(times, events):
+    """Tính đường cong Kaplan–Meier (events: 1=dead, 0=censored/alive)."""
+    df = pd.DataFrame({
+        "t": pd.to_numeric(times, errors="coerce"),
+        "e": pd.to_numeric(events, errors="coerce").fillna(0).astype(int),
+    }).dropna(subset=["t"]).sort_values("t")
+    if len(df) == 0:
+        return [0.0], [1.0]
+
+    S = 1.0
+    out_t, out_s = [0.0], [1.0]
+    for t in sorted(df["t"].unique()):
+        at_risk = int((df["t"] >= t).sum())
+        deaths = int(df.loc[df["t"] == t, "e"].sum())
+        if at_risk > 0 and deaths > 0:
+            S *= (1.0 - deaths / at_risk)
+            out_t.append(float(t))
+            out_s.append(round(max(S, 0.0), 4))
+    return out_t, out_s
+
+
+@app.post("/api/analysis/kaplan-meier")
+def api_kaplan_meier(payload: KaplanMeierPayload):
     if _df is None:
         raise HTTPException(status_code=503, detail="Dataset chưa sẵn sàng.")
     d = _apply_filters(_df, payload.filters)
+    col = payload.group_by
+    if col not in d.columns:
+        raise HTTPException(status_code=400, detail=f"Cột '{col}' không tồn tại.")
     if len(d) == 0:
-        return {
-            "total": 0, "risk_hist": {}, "level_dist": {},
-            "risk_by_status": {}, "risk_by_stage": {},
-            "risk_factors": [], "factor_correlation": [],
-            "top_risk_patients": [],
-            "risk_stats": {"mean": 0, "median": 0, "min": 0, "max": 0},
-        }
-    d = d.copy()
+        return {"group_by": col, "curves": [], "overall": None,
+                "categories": [], "total": 0}
 
-    # --- Tính Risk Score (0–100) từ 4 yếu tố chính ---
-    size  = pd.to_numeric(d.get("tumor_size", 0), errors="coerce").fillna(0)
-    nodes = pd.to_numeric(d.get("regional_node_positive", 0), errors="coerce").fillna(0)
-    grade = pd.to_numeric(d.get("grade", 1), errors="coerce").fillna(1)
+    status_col = (d["status"].astype(str).str.lower()
+                  if "status" in d.columns else pd.Series(["alive"] * len(d)))
+    events = status_col.isin(["dead", "1", "yes", "true"]).astype(int).to_numpy()
 
-    n_map = {"N1": 1, "N2": 2, "N3": 3}
-    if "n_stage" in d.columns:
-        n_stage = d["n_stage"].astype(str).str.upper().map(n_map).fillna(1)
-    else:
-        n_stage = pd.Series([1] * len(d), index=d.index)
+    groups = d[col].astype(str)
+    unique = sorted(groups.dropna().unique().tolist())
 
-    size_n   = (size.clip(0, 100) / 100).clip(0, 1)
-    nodes_n  = (nodes.clip(0, 20) / 20).clip(0, 1)
-    grade_n  = ((grade - 1) / 3).clip(0, 1)
-    nstage_n = ((n_stage - 1) / 2).clip(0, 1)
-
-    risk = (size_n * 25 + nodes_n * 35 + grade_n * 20 + nstage_n * 20).round(1)
-    d["risk_score"] = risk
-
-    def _lvl(r):
-        if r < 25:  return "Low"
-        if r < 50:  return "Medium"
-        if r < 75:  return "High"
-        return "Very High"
-    d["risk_level"] = d["risk_score"].apply(_lvl)
-
-    # --- Histogram Risk Score ---
-    bins   = list(range(0, 101, 10))
-    labels = [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins) - 1)]
-    risk_hist = (pd.cut(d["risk_score"], bins=bins, labels=labels, right=False)
-                 .value_counts().reindex(labels).fillna(0).astype(int).to_dict())
-
-    level_dist = d["risk_level"].value_counts().to_dict()
-
-    risk_by_status = (d.groupby("status")["risk_score"].mean().round(1).to_dict()
-                      if "status" in d.columns else {})
-    risk_by_stage  = (d.groupby("stage_6th")["risk_score"].mean().round(1).to_dict()
-                      if "stage_6th" in d.columns else {})
-
-    # --- Yếu tố nguy cơ: trung bình & tương quan với risk_score ---
-    factor_cols = ["tumor_size", "regional_node_positive", "grade",
-                   "survival_months", "age"]
-    risk_factors, factor_corr = [], []
-    for c in factor_cols:
-        if c not in d.columns:
+    curves = []
+    for g in unique:
+        mask = (groups == g).to_numpy()
+        if mask.sum() == 0:
             continue
-        s = pd.to_numeric(d[c], errors="coerce")
-        risk_factors.append({
-            "factor": c,
-            "mean":   _safe(s.mean()),
-            "median": _safe(s.median()),
-            "min":    _safe(s.min()),
-            "max":    _safe(s.max()),
-        })
-        try:
-            v = s.corr(d["risk_score"])
-            factor_corr.append({"factor": c,
-                                "correlation": round(float(v or 0), 3)})
-        except Exception:
-            pass
+        sub_t = d.loc[mask, "survival_months"].to_numpy()
+        sub_e = events[mask]
+        ts, ss = _kaplan_meier(sub_t, sub_e)
 
-    # --- Top 10 bệnh nhân nguy cơ cao ---
-    top_risk = []
-    for _, row in d.nlargest(10, "risk_score").iterrows():
-        top_risk.append({
-            "age":                    _safe(row.get("age")),
-            "tumor_size":             _safe(row.get("tumor_size")),
-            "n_stage":                str(row.get("n_stage", "")),
-            "grade":                  _safe(row.get("grade")),
-            "regional_node_positive": _safe(row.get("regional_node_positive")),
-            "risk_score":             _safe(row.get("risk_score")),
-            "risk_level":             str(row.get("risk_level", "")),
-            "status":                 str(row.get("status", "")),
+        median = None
+        for tt, sv in zip(ts, ss):
+            if sv <= 0.5:
+                median = float(tt)
+                break
+
+        curves.append({
+            "group":            g,
+            "times":            ts,
+            "survival":         ss,
+            "n":                int(mask.sum()),
+            "events":           int(sub_e.sum()),
+            "median_survival":  median,
         })
+
+    # Đường tổng (toàn bộ dataset)
+    gt, gs = _kaplan_meier(d["survival_months"].to_numpy(), events)
+    overall_median = next((float(t) for t, s in zip(gt, gs) if s <= 0.5), None)
+    overall = {
+        "group":           "Tất cả",
+        "times":           gt,
+        "survival":        gs,
+        "n":               int(len(d)),
+        "events":          int(events.sum()),
+        "median_survival": overall_median,
+    }
 
     return {
-        "total": int(len(d)),
-        "risk_hist":          risk_hist,
-        "level_dist":         {str(k): int(v) for k, v in level_dist.items()},
-        "risk_by_status":     {str(k): float(v) for k, v in risk_by_status.items()},
-        "risk_by_stage":      {str(k): float(v) for k, v in risk_by_stage.items()},
-        "risk_factors":       risk_factors,
-        "factor_correlation": factor_corr,
-        "top_risk_patients":  top_risk,
-        "risk_stats": {
-            "mean":   _safe(d["risk_score"].mean()),
-            "median": _safe(d["risk_score"].median()),
-            "min":    _safe(d["risk_score"].min()),
-            "max":    _safe(d["risk_score"].max()),
-        },
+        "group_by":   col,
+        "curves":     curves,
+        "overall":    overall,
+        "categories": unique,
+        "total":      int(len(d)),
     }
 
 
 # ==============================================================
-# 🆕 3f. GROUP COMPARISON — So sánh nhóm
+# 3f. GROUP COMPARISON — So sánh nhóm
 # ==============================================================
 @app.post("/api/analysis/compare")
 def api_compare(payload: ComparePayload):
@@ -1565,7 +1543,7 @@ body{
         <div class="feat__ic">📊</div>
         <div>
           <div class="feat__t">Dashboard trực quan</div>
-          <div class="feat__d">10 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, nguy cơ, so sánh, ML…</div>
+          <div class="feat__d">10 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, Kaplan-Meier, ML…</div>
         </div>
       </div>
       <div class="feat">
@@ -1727,8 +1705,14 @@ $("formRegister").addEventListener("submit", async (e) => {
   if (body.password.length < 6) return msg("Mật khẩu cần tối thiểu 6 ký tự.");
   try {
     await call("/api/auth/register", body, $("btnRegister"), $("regTxt"), "Đang tạo…");
-    msg("Tạo tài khoản thành công. Đang chuyển hướng…", "ok");
-    setTimeout(() => location.href = "/", 500);
+    msg("Tạo tài khoản thành công. Vui lòng đăng nhập.", "ok");
+    // Chuyển về tab đăng nhập, điền sẵn username
+    setTimeout(() => {
+      $("loginUser").value = body.username;
+      $("loginPass").value = "";
+      $("loginPass").focus();
+      switchTab("login");
+    }, 700);
   } catch (err) {
     msg(err.message);
   }
@@ -2532,41 +2516,66 @@ table.dt td.mono{font-family:var(--mono)}
     <button class="tab" data-tab="disease">🩺 Bệnh &amp; Khối u</button>
     <button class="tab" data-tab="biology">🧬 Yếu tố sinh học</button>
     <button class="tab" data-tab="survival">⏱️ Phân tích sống còn</button>
-    <button class="tab" data-tab="risk">⚠️ Phân tích nguy cơ</button>
+    <button class="tab" data-tab="km">📈 Kaplan–Meier</button>
     <button class="tab" data-tab="compare">👥 So sánh nhóm</button>
     <button class="tab" data-tab="predict">🤖 Dự đoán</button>
     <button class="tab" data-tab="svm">🧪 SVM 30 đặc trưng</button>
   </nav>
 
   <!-- ============================================================
-       TAB 1 — TRANG TỔNG QUAN
+       TAB 1 — TRANG TỔNG QUAN (chỉ giới thiệu)
        ============================================================ -->
   <section class="tabpanel is-active" data-panel="overview">
     <div class="panel">
       <div class="panel__head">
-        <h2>Tổng quan dữ liệu</h2>
-        <button class="btn btn--ghost btn--sm" id="btnRefreshOverview">🔄 Làm mới</button>
+        <h2>🌸 Giới thiệu hệ thống</h2>
       </div>
-      <div class="panel__body">
-        <div class="stat-grid" id="ovStats"></div>
-      </div>
-    </div>
+      <div class="panel__body" style="padding:44px 40px">
+        <div style="max-width:840px;margin:0 auto;line-height:1.85">
+          <h1 style="font-size:32px;font-weight:800;letter-spacing:-.8px;margin:0 0 8px;
+            background:linear-gradient(120deg,#818cf8 0%,#67e8f9 40%,#f0abfc 80%);
+            -webkit-background-clip:text;background-clip:text;color:transparent">
+            Breast Cancer Analytics
+          </h1>
+          <p class="muted" style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:26px">
+            Clinical Intelligence Suite · v3.2
+          </p>
 
-    <div class="chart-grid two">
-      <div class="chart-card">
-        <div class="chart-card__title">🌡️ Tình trạng sống: Alive / Dead</div>
-        <div class="chart-card__desc">
-          Biểu đồ cho thấy tỉ lệ bệnh nhân còn sống và đã tử vong trong toàn bộ dữ liệu.
+          <p style="font-size:15.5px;color:var(--text-muted)">
+            Chào mừng bạn đến với <strong style="color:var(--text)">Bảng điều khiển phân tích dữ liệu bệnh nhân ung thư vú</strong> —
+            một nền tảng học thuật giúp khám phá các đặc điểm lâm sàng, giai đoạn bệnh,
+            yếu tố sinh học và mối liên hệ với thời gian sống còn của bệnh nhân.
+          </p>
+
+          <p style="font-size:15.5px;color:var(--text-muted);margin-top:16px">
+            Hệ thống tích hợp <strong style="color:var(--text)">phân tích thống kê mô tả</strong>,
+            <strong style="color:var(--text)">đường cong sống còn Kaplan–Meier</strong>,
+            <strong style="color:var(--text)">so sánh nhóm</strong>, và
+            <strong style="color:var(--text)">5 mô hình học máy</strong> (Logistic, Random Forest,
+            Gradient Boosting, Decision Tree, SVM 30 đặc trưng).
+          </p>
+
+          <h3 style="margin-top:34px;font-size:16px;color:var(--text);
+            display:flex;align-items:center;gap:10px">
+            ✨ Các chức năng chính
+          </h3>
+          <ul style="margin:14px 0 0;padding-left:24px;color:var(--text-muted);line-height:2.1;font-size:14.5px">
+            <li><strong style="color:var(--text)">🔍 Khám phá dữ liệu</strong> — lọc, sắp xếp, tìm kiếm toàn bộ bảng dữ liệu.</li>
+            <li><strong style="color:var(--text)">👤 Đặc điểm bệnh nhân</strong> — nhân khẩu học: tuổi, chủng tộc, hôn nhân.</li>
+            <li><strong style="color:var(--text)">🩺 Bệnh &amp; Khối u</strong> — giai đoạn, kích thước, grade, biệt hoá.</li>
+            <li><strong style="color:var(--text)">🧬 Yếu tố sinh học</strong> — estrogen, progesterone, hạch bạch huyết.</li>
+            <li><strong style="color:var(--text)">⏱️ Phân tích sống còn</strong> — histogram, boxplot, scatter, ma trận tương quan.</li>
+            <li><strong style="color:var(--text)">📈 Kaplan–Meier</strong> — đường cong sống còn theo nhóm (Race, Stage, Grade…).</li>
+            <li><strong style="color:var(--text)">👥 So sánh nhóm</strong> — đối chiếu trực tiếp 2 nhóm bệnh nhân.</li>
+            <li><strong style="color:var(--text)">🤖 Dự đoán</strong> — 4 mô hình ML với AUC so sánh tức thời.</li>
+            <li><strong style="color:var(--text)">🧪 SVM 30 đặc trưng</strong> — chẩn đoán malignant / benign.</li>
+          </ul>
+
+          <div class="note" style="margin-top:32px;font-size:12.5px">
+            ⚕️ <strong>Lưu ý:</strong> Đây là demo học thuật. Mọi kết quả phân tích
+            không thay thế chẩn đoán y khoa chuyên nghiệp.
+          </div>
         </div>
-        <div class="chart-wrap"><canvas id="ovStatus"></canvas></div>
-      </div>
-      <div class="chart-card">
-        <div class="chart-card__title">📊 Phân bố các giai đoạn bệnh</div>
-        <div class="chart-card__desc">
-          Số lượng bệnh nhân được chẩn đoán ở từng giai đoạn (6th Stage) — giúp thấy được
-          bức tranh tổng thể về mức độ phát hiện bệnh.
-        </div>
-        <div class="chart-wrap"><canvas id="ovStage"></canvas></div>
       </div>
     </div>
   </section>
@@ -2790,71 +2799,64 @@ table.dt td.mono{font-family:var(--mono)}
   </section>
 
   <!-- ============================================================
-       🆕 TAB 6b — PHÂN TÍCH NGUY CƠ
+       TAB 6b — KAPLAN–MEIER SURVIVAL CURVE
        ============================================================ -->
-  <section class="tabpanel" data-panel="risk">
+  <section class="tabpanel" data-panel="km">
     <div class="panel">
       <div class="panel__head">
-        <h2>⚠️ Phân tích nguy cơ (Risk Score)</h2>
-        <button class="btn btn--ghost btn--sm" data-refresh="risk">🔄</button>
+        <h2>📈 Đường cong sống còn Kaplan–Meier</h2>
       </div>
       <div class="panel__body">
-        <div class="stat-grid" id="riskStats"></div>
-        <div class="note" style="margin-top:16px">
-          <strong>Risk Score</strong> = 25% kích thước khối u + 35% số hạch dương tính
-          + 20% Grade + 20% N Stage (thang điểm 0 – 100).
-          <em>Low &lt; 25 · Medium &lt; 50 · High &lt; 75 · Very High ≥ 75.</em>
+        <div class="filter-grid">
+          <div class="filter-field">
+            <label>Phân nhóm theo</label>
+            <select id="kmGroupBy">
+              <option value="race">Race (Chủng tộc)</option>
+              <option value="estrogen_status">Estrogen Status</option>
+              <option value="progesterone_status">Progesterone Status</option>
+              <option value="grade">Grade</option>
+              <option value="t_stage">T Stage</option>
+              <option value="n_stage">N Stage</option>
+              <option value="stage_6th" selected>6th Stage</option>
+            </select>
+          </div>
+          <div class="filter-field" style="align-self:flex-end">
+            <button class="btn btn--primary" id="kmRun" style="width:100%">📈 Vẽ đường cong</button>
+          </div>
         </div>
-      </div>
-    </div>
-
-    <div class="chart-grid two">
-      <div class="chart-card">
-        <div class="chart-card__title">📊 Phân bố Risk Score</div>
-        <div class="chart-card__desc">
-          Histogram điểm nguy cơ — cho thấy phần lớn bệnh nhân tập trung ở mức nào.
+        <div class="note" style="margin-top:14px">
+          <strong>Kaplan–Meier</strong> — Trục X: <em>Survival Months</em>,
+          Trục Y: <em>Probability of Survival</em>. Đường cong bậc thang thể hiện
+          xác suất sống sót theo thời gian cho từng nhóm bệnh nhân.
+          Đường <em>nét đứt</em> là đường tổng của toàn bộ tập dữ liệu.
         </div>
-        <div class="chart-wrap"><canvas id="riskHist"></canvas></div>
-      </div>
-      <div class="chart-card">
-        <div class="chart-card__title">🎯 Mức độ nguy cơ</div>
-        <div class="chart-card__desc">
-          Tỉ lệ bệnh nhân theo 4 mức: Low / Medium / High / Very High.
-        </div>
-        <div class="chart-wrap"><canvas id="riskLevel"></canvas></div>
-      </div>
-    </div>
-
-    <div class="chart-grid two">
-      <div class="chart-card">
-        <div class="chart-card__title">🧬 Yếu tố nguy cơ — tương quan với Risk Score</div>
-        <div class="chart-card__desc">
-          Mức độ ảnh hưởng của từng yếu tố (Tumor Size, Node Positive, Grade…)
-          lên Risk Score. Càng gần ±1 thì ảnh hưởng càng mạnh.
-        </div>
-        <div class="chart-wrap"><canvas id="riskFactors"></canvas></div>
-      </div>
-      <div class="chart-card">
-        <div class="chart-card__title">📈 Risk Score theo giai đoạn bệnh</div>
-        <div class="chart-card__desc">
-          Điểm nguy cơ trung bình cho từng giai đoạn (6th Stage) — giai đoạn cao → điểm cao.
-        </div>
-        <div class="chart-wrap"><canvas id="riskByStage"></canvas></div>
       </div>
     </div>
 
     <div class="panel">
       <div class="panel__head">
-        <h2>🚨 Top 10 bệnh nhân nguy cơ cao nhất</h2>
+        <h2>📊 Đường cong sống còn</h2>
+        <span class="muted" id="kmInfo">—</span>
       </div>
       <div class="panel__body">
-        <div class="table-wrap" id="riskTable"></div>
+        <div class="chart-card" style="padding:14px">
+          <div class="chart-wrap" style="height:460px"><canvas id="kmChart"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__head">
+        <h2>📋 Tóm tắt theo nhóm</h2>
+      </div>
+      <div class="panel__body">
+        <div class="table-wrap" id="kmTable"></div>
       </div>
     </div>
   </section>
 
   <!-- ============================================================
-       🆕 TAB 6c — SO SÁNH NHÓM
+       TAB 6c — SO SÁNH NHÓM
        ============================================================ -->
   <section class="tabpanel" data-panel="compare">
     <div class="panel">
@@ -3154,21 +3156,21 @@ const Api = (() => {
     body:JSON.stringify(body||{})
   });
   return {
-    predict:  (payload) => post(CONFIG.API_URL, payload),
-    health:   () => request(CONFIG.HEALTH_URL),
-    meta:     () => request("/api/meta"),
-    overview: () => request("/api/overview"),
-    data:     (p) => post("/api/data", p),
-    patients: (p) => post("/api/analysis/patients", p),
-    disease:  (p) => post("/api/analysis/disease", p),
-    biology:  (p) => post("/api/analysis/biology", p),
-    survival: (p) => post("/api/analysis/survival", p),
-    risk:     (p) => post("/api/analysis/risk", p),        // 🆕
-    compare:  (p) => post("/api/analysis/compare", p),     // 🆕
-    train:    () => post("/api/ml/train", {}),
-    mlPredict:(p) => post("/api/ml/predict", p),
-    me:       () => request("/api/auth/me"),
-    logout:   () => post("/api/auth/logout", {}),
+    predict:     (payload) => post(CONFIG.API_URL, payload),
+    health:      () => request(CONFIG.HEALTH_URL),
+    meta:        () => request("/api/meta"),
+    overview:    () => request("/api/overview"),
+    data:        (p) => post("/api/data", p),
+    patients:    (p) => post("/api/analysis/patients", p),
+    disease:     (p) => post("/api/analysis/disease", p),
+    biology:     (p) => post("/api/analysis/biology", p),
+    survival:    (p) => post("/api/analysis/survival", p),
+    kaplanMeier: (p) => post("/api/analysis/kaplan-meier", p),
+    compare:     (p) => post("/api/analysis/compare", p),
+    train:       () => post("/api/ml/train", {}),
+    mlPredict:   (p) => post("/api/ml/predict", p),
+    me:          () => request("/api/auth/me"),
+    logout:      () => post("/api/auth/logout", {}),
   };
 })();
 
@@ -3848,81 +3850,178 @@ const Dashboard = (() => {
   }
 
   /* ============================================================
-     🆕 RISK ANALYSIS — Phân tích nguy cơ
+     KAPLAN–MEIER — Đường cong sống còn
      ============================================================ */
-  async function loadRisk() {
+  const KM_PALETTE = [
+    "#6366f1", "#ec4899", "#10b981", "#f59e0b", "#06b6d4", "#a855f7",
+    "#ef4444", "#84cc16", "#f97316", "#14b8a6", "#8b5cf6", "#f43f5e",
+  ];
+
+  async function loadKaplanMeier() {
+    if (state._kmBound) {
+      await runKaplanMeier();
+      return;
+    }
+    state._kmBound = true;
+    $("kmRun").addEventListener("click", runKaplanMeier);
+    await runKaplanMeier();
+  }
+
+  async function runKaplanMeier() {
+    const group_by = $("kmGroupBy").value;
+    $("kmInfo").textContent = "⏳ Đang tính toán…";
     try {
-      const d = await Api.risk({filters: state.filters});
+      const d = await Api.kaplanMeier({filters: state.filters, group_by});
 
-      $("riskStats").innerHTML =
-        statCard("⚠️","Tổng", d.total, "blue") +
-        statCard("📈","Risk TB", num(d.risk_stats?.mean, 1), "red") +
-        statCard("📊","Trung vị", num(d.risk_stats?.median, 1), "gray") +
-        statCard("⬆️","Cao nhất", num(d.risk_stats?.max, 1), "red");
+      if (!d.curves || d.curves.length === 0) {
+        $("kmInfo").textContent = "Không có dữ liệu.";
+        Charts.destroy("kmChart");
+        $("kmTable").innerHTML = `<div style="padding:22px" class="muted">Không có dữ liệu.</div>`;
+        return;
+      }
 
-      const cH = document.getElementById("riskHist")?.getContext("2d");
-      let gH = CLR.red;
-      if (cH) { gH = cH.createLinearGradient(0,0,0,280);
-        gH.addColorStop(0,"#fbbf24"); gH.addColorStop(.5,"#f87171"); gH.addColorStop(1,"#dc2626"); }
-      Charts.make("riskHist", {
-        type:"bar",
-        data:{labels:Object.keys(d.risk_hist || {}),
-          datasets:[{label:"Số bệnh nhân", data:Object.values(d.risk_hist || {}),
-            backgroundColor:gH, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
-        options:Charts.baseOpts()
+      $("kmInfo").textContent =
+        `${d.total} bệnh nhân · ${d.curves.length} nhóm · theo ${group_by}`;
+
+      const datasets = [];
+      d.curves.forEach((c, i) => {
+        const color = KM_PALETTE[i % KM_PALETTE.length];
+        datasets.push({
+          label: `${c.group} (n=${c.n})`,
+          data: c.times.map((t, k) => ({x: t, y: c.survival[k]})),
+          borderColor: color,
+          backgroundColor: color + "22",
+          borderWidth: 2.5,
+          stepped: "before",
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHoverBackgroundColor: color,
+          pointHoverBorderColor: "#fff",
+          pointHoverBorderWidth: 2,
+          fill: false,
+          tension: 0,
+        });
       });
 
-      const levelOrder  = ["Low","Medium","High","Very High"];
-      const levelColors = ["#10b981","#f59e0b","#f97316","#ef4444"];
-      const levelLabels = levelOrder.filter(l => (d.level_dist||{})[l] !== undefined);
-      Charts.make("riskLevel", {
-        type:"doughnut",
-        data:{labels: levelLabels,
-          datasets:[{data: levelLabels.map(l => d.level_dist[l]),
-            backgroundColor: levelColors.slice(0, levelLabels.length),
-            borderWidth:0, hoverOffset:10, spacing:2}]},
-        options:{responsive:true, maintainAspectRatio:false, cutout:"66%",
-          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor(),
-            padding:14, usePointStyle:true, pointStyle:"circle", boxWidth:9, boxHeight:9}}}}
+      if (d.overall) {
+        datasets.push({
+          label: `Tất cả (n=${d.overall.n})`,
+          data: d.overall.times.map((t, k) => ({x: t, y: d.overall.survival[k]})),
+          borderColor: Charts.textColor(),
+          borderDash: [7, 5],
+          borderWidth: 2,
+          stepped: "before",
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          fill: false,
+          tension: 0,
+        });
+      }
+
+      const maxTime = Math.max(
+        120,
+        ...datasets.flatMap(ds => ds.data.map(p => p.x || 0))
+      );
+
+      Charts.make("kmChart", {
+        type: "line",
+        data: {datasets},
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {mode: "nearest", intersect: false},
+          plugins: {
+            legend: {
+              position: "bottom",
+              labels: {
+                color: Charts.textColor(),
+                usePointStyle: true,
+                pointStyle: "line",
+                boxWidth: 26, boxHeight: 3,
+                padding: 14,
+                font: {family: "Plus Jakarta Sans", size: 11.5, weight: "600"},
+              },
+            },
+            tooltip: {
+              backgroundColor: "rgba(15,23,42,.94)",
+              borderColor: "rgba(99,102,241,.5)",
+              borderWidth: 1,
+              padding: 12,
+              cornerRadius: 10,
+              callbacks: {
+                title: (items) => items.length ? `⏱ Tháng ${items[0].parsed.x}` : "",
+                label: (c) =>
+                  ` ${c.dataset.label}: S(t) = ${(c.parsed.y * 100).toFixed(1)}%`,
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: "linear",
+              min: 0,
+              max: maxTime,
+              title: {
+                display: true,
+                text: "Survival Months",
+                color: Charts.textColor(),
+                font: {size: 12, weight: "600"},
+              },
+              ticks: {color: Charts.textColor(), stepSize: Math.ceil(maxTime / 12)},
+              grid: {color: Charts.gridColor()},
+            },
+            y: {
+              min: 0,
+              max: 1,
+              title: {
+                display: true,
+                text: "Probability of Survival",
+                color: Charts.textColor(),
+                font: {size: 12, weight: "600"},
+              },
+              ticks: {
+                color: Charts.textColor(),
+                callback: (v) => (v * 100).toFixed(0) + "%",
+              },
+              grid: {color: Charts.gridColor()},
+            },
+          },
+        },
       });
 
-      const fc = (d.factor_correlation || []).slice().sort((a,b) => Math.abs(b.correlation)-Math.abs(a.correlation));
-      const fLabels = fc.map(x => x.factor.replace(/_/g," "));
-      const fVals   = fc.map(x => x.correlation);
-      const fColors = fVals.map(v => v >= 0 ? "rgba(239,68,68,.85)" : "rgba(16,185,129,.85)");
-      Charts.make("riskFactors", {
-        type:"bar",
-        data:{labels: fLabels,
-          datasets:[{label:"Tương quan với Risk Score", data: fVals,
-            backgroundColor: fColors, borderRadius:8, borderSkipped:false, maxBarThickness:32}]},
-        options:{...Charts.baseOpts(), indexAxis:"y",
-          scales:{x:{min:-1,max:1,ticks:{color:Charts.textColor()},grid:{color:Charts.gridColor()}},
-                  y:{ticks:{color:Charts.textColor()},grid:{display:false}}}}
-      });
+      const rows = d.curves.map(c => ({
+        group:            c.group,
+        n:                c.n,
+        events:           c.events,
+        median_survival:  c.median_survival === null || c.median_survival === undefined
+                            ? "—" : c.median_survival.toFixed(0),
+        final_survival:   c.survival.length
+                            ? (c.survival[c.survival.length - 1] * 100).toFixed(1) + "%"
+                            : "—",
+      }));
+      if (d.overall) {
+        rows.unshift({
+          group:            "🌐 Tất cả",
+          n:                d.overall.n,
+          events:           d.overall.events,
+          median_survival:  d.overall.median_survival == null
+                              ? "—" : d.overall.median_survival.toFixed(0),
+          final_survival:   d.overall.survival.length
+                              ? (d.overall.survival[d.overall.survival.length - 1] * 100).toFixed(1) + "%"
+                              : "—",
+        });
+      }
 
-      const stages = Object.keys(d.risk_by_stage || {}).sort();
-      const cS = document.getElementById("riskByStage")?.getContext("2d");
-      let gS = CLR.purple;
-      if (cS) { gS = cS.createLinearGradient(0,0,0,280);
-        gS.addColorStop(0,"#c084fc"); gS.addColorStop(1,"#7c3aed"); }
-      Charts.make("riskByStage", {
-        type:"bar",
-        data:{labels: stages,
-          datasets:[{label:"Risk Score TB", data: stages.map(s => d.risk_by_stage[s]),
-            backgroundColor: gS, borderRadius:8, borderSkipped:false, maxBarThickness:54}]},
-        options:Charts.baseOpts()
-      });
-
-      const cols = ["age","tumor_size","n_stage","grade","regional_node_positive",
-                    "risk_score","risk_level","status"];
-      buildTable("riskTable", cols, d.top_risk_patients || []);
+      buildTable("kmTable",
+        ["group", "n", "events", "median_survival", "final_survival"],
+        rows);
     } catch(e) {
-      $("riskStats").innerHTML = `<div class="alert">${e.message}</div>`;
+      $("kmInfo").textContent = "Lỗi: " + e.message;
+      Toast.show("Kaplan-Meier thất bại: " + e.message, "err");
     }
   }
 
   /* ============================================================
-     🆕 GROUP COMPARISON — So sánh nhóm
+     GROUP COMPARISON — So sánh nhóm
      ============================================================ */
   async function loadCompare() {
     async function refreshOptions() {
@@ -4050,20 +4149,22 @@ const Dashboard = (() => {
 
   async function load(name) {
     try {
-      if (name === "overview") { await loadOverview(); }
+      if (name === "overview") {
+        // Trang tổng quan chỉ hiển thị giới thiệu — không tải dữ liệu
+      }
       else if (name === "data") { await loadMeta(); buildFilterUI(); await loadDataTable(); }
       else if (name === "patients") { await loadPatients(); }
       else if (name === "disease") { await loadDisease(); }
       else if (name === "biology") { await loadBiology(); }
       else if (name === "survival") { await loadSurvival(); }
-      else if (name === "risk")     { await loadRisk(); }       // 🆕
-      else if (name === "compare")  { await loadCompare(); }    // 🆕
-      else if (name === "predict") { await ensureModel(); }
+      else if (name === "km")       { await loadKaplanMeier(); }
+      else if (name === "compare")  { await loadCompare(); }
+      else if (name === "predict")  { await ensureModel(); }
     } catch(e) { console.error("[load]", name, e); }
   }
 
   function bind() {
-    $("btnRefreshOverview").addEventListener("click", loadOverview);
+    $("btnRefreshOverview")?.addEventListener("click", loadOverview);
     $("btnApplyFilter").addEventListener("click", () => {
       state.filters = collectFilters(); state.page = 1; loadDataTable();
     });
