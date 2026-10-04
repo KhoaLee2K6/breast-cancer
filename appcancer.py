@@ -1,8 +1,3 @@
-from fastapi import FastAPI, HTTPException, Body, Query, Request, Response, Depends, Cookie
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 import os
 import pandas as pd
 import io
@@ -10,6 +5,12 @@ import math
 import numpy as np
 import joblib
 import uvicorn
+from fastapi import FastAPI, HTTPException, Body, Query, Request, Response, Depends, Cookie
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+
 
 # ==== SECURITY (SQL) ====
 import sqlite3
@@ -604,6 +605,14 @@ class PatientInput(BaseModel):
     model: str = "Random Forest"
 
 
+# 🆕 NEW SCHEMA — Group comparison
+class ComparePayload(BaseModel):
+    filters: Optional[Dict[str, Any]] = None
+    group_by: str = "stage_6th"
+    group_a: str
+    group_b: str
+
+
 class LoginPayload(BaseModel):
     username: str = Field(..., min_length=3, max_length=64)
     password: str = Field(..., min_length=6, max_length=200)
@@ -625,7 +634,7 @@ CLASS_LABELS = ["malignant", "benign"]
 app = FastAPI(
     title="Breast Cancer Analytics API",
     description="Dashboard phân tích sống còn + SVM chẩn đoán 30 đặc trưng. Có bảo mật SQL.",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -1105,6 +1114,186 @@ def api_survival(payload: FilterPayload):
     }
 
 
+# ==============================================================
+# 🆕 3e. RISK ANALYSIS — Phân tích nguy cơ
+# ==============================================================
+@app.post("/api/analysis/risk")
+def api_risk(payload: FilterPayload):
+    if _df is None:
+        raise HTTPException(status_code=503, detail="Dataset chưa sẵn sàng.")
+    d = _apply_filters(_df, payload.filters)
+    if len(d) == 0:
+        return {
+            "total": 0, "risk_hist": {}, "level_dist": {},
+            "risk_by_status": {}, "risk_by_stage": {},
+            "risk_factors": [], "factor_correlation": [],
+            "top_risk_patients": [],
+            "risk_stats": {"mean": 0, "median": 0, "min": 0, "max": 0},
+        }
+    d = d.copy()
+
+    # --- Tính Risk Score (0–100) từ 4 yếu tố chính ---
+    size  = pd.to_numeric(d.get("tumor_size", 0), errors="coerce").fillna(0)
+    nodes = pd.to_numeric(d.get("regional_node_positive", 0), errors="coerce").fillna(0)
+    grade = pd.to_numeric(d.get("grade", 1), errors="coerce").fillna(1)
+
+    n_map = {"N1": 1, "N2": 2, "N3": 3}
+    if "n_stage" in d.columns:
+        n_stage = d["n_stage"].astype(str).str.upper().map(n_map).fillna(1)
+    else:
+        n_stage = pd.Series([1] * len(d), index=d.index)
+
+    size_n   = (size.clip(0, 100) / 100).clip(0, 1)
+    nodes_n  = (nodes.clip(0, 20) / 20).clip(0, 1)
+    grade_n  = ((grade - 1) / 3).clip(0, 1)
+    nstage_n = ((n_stage - 1) / 2).clip(0, 1)
+
+    risk = (size_n * 25 + nodes_n * 35 + grade_n * 20 + nstage_n * 20).round(1)
+    d["risk_score"] = risk
+
+    def _lvl(r):
+        if r < 25:  return "Low"
+        if r < 50:  return "Medium"
+        if r < 75:  return "High"
+        return "Very High"
+    d["risk_level"] = d["risk_score"].apply(_lvl)
+
+    # --- Histogram Risk Score ---
+    bins   = list(range(0, 101, 10))
+    labels = [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins) - 1)]
+    risk_hist = (pd.cut(d["risk_score"], bins=bins, labels=labels, right=False)
+                 .value_counts().reindex(labels).fillna(0).astype(int).to_dict())
+
+    level_dist = d["risk_level"].value_counts().to_dict()
+
+    risk_by_status = (d.groupby("status")["risk_score"].mean().round(1).to_dict()
+                      if "status" in d.columns else {})
+    risk_by_stage  = (d.groupby("stage_6th")["risk_score"].mean().round(1).to_dict()
+                      if "stage_6th" in d.columns else {})
+
+    # --- Yếu tố nguy cơ: trung bình & tương quan với risk_score ---
+    factor_cols = ["tumor_size", "regional_node_positive", "grade",
+                   "survival_months", "age"]
+    risk_factors, factor_corr = [], []
+    for c in factor_cols:
+        if c not in d.columns:
+            continue
+        s = pd.to_numeric(d[c], errors="coerce")
+        risk_factors.append({
+            "factor": c,
+            "mean":   _safe(s.mean()),
+            "median": _safe(s.median()),
+            "min":    _safe(s.min()),
+            "max":    _safe(s.max()),
+        })
+        try:
+            v = s.corr(d["risk_score"])
+            factor_corr.append({"factor": c,
+                                "correlation": round(float(v or 0), 3)})
+        except Exception:
+            pass
+
+    # --- Top 10 bệnh nhân nguy cơ cao ---
+    top_risk = []
+    for _, row in d.nlargest(10, "risk_score").iterrows():
+        top_risk.append({
+            "age":                    _safe(row.get("age")),
+            "tumor_size":             _safe(row.get("tumor_size")),
+            "n_stage":                str(row.get("n_stage", "")),
+            "grade":                  _safe(row.get("grade")),
+            "regional_node_positive": _safe(row.get("regional_node_positive")),
+            "risk_score":             _safe(row.get("risk_score")),
+            "risk_level":             str(row.get("risk_level", "")),
+            "status":                 str(row.get("status", "")),
+        })
+
+    return {
+        "total": int(len(d)),
+        "risk_hist":          risk_hist,
+        "level_dist":         {str(k): int(v) for k, v in level_dist.items()},
+        "risk_by_status":     {str(k): float(v) for k, v in risk_by_status.items()},
+        "risk_by_stage":      {str(k): float(v) for k, v in risk_by_stage.items()},
+        "risk_factors":       risk_factors,
+        "factor_correlation": factor_corr,
+        "top_risk_patients":  top_risk,
+        "risk_stats": {
+            "mean":   _safe(d["risk_score"].mean()),
+            "median": _safe(d["risk_score"].median()),
+            "min":    _safe(d["risk_score"].min()),
+            "max":    _safe(d["risk_score"].max()),
+        },
+    }
+
+
+# ==============================================================
+# 🆕 3f. GROUP COMPARISON — So sánh nhóm
+# ==============================================================
+@app.post("/api/analysis/compare")
+def api_compare(payload: ComparePayload):
+    if _df is None:
+        raise HTTPException(status_code=503, detail="Dataset chưa sẵn sàng.")
+    d = _apply_filters(_df, payload.filters)
+    col = payload.group_by
+    if col not in d.columns:
+        raise HTTPException(status_code=400, detail=f"Cột '{col}' không tồn tại.")
+
+    a = d[d[col].astype(str) == str(payload.group_a)]
+    b = d[d[col].astype(str) == str(payload.group_b)]
+
+    def _stats(sub):
+        if len(sub) == 0:
+            return {"n": 0}
+        res = {"n": int(len(sub))}
+        for c in ["age", "tumor_size", "regional_node_positive", "survival_months"]:
+            if c in sub.columns:
+                s = pd.to_numeric(sub[c], errors="coerce")
+                res[c] = {
+                    "mean":   _safe(s.mean()),
+                    "median": _safe(s.median()),
+                    "std":    _safe(s.std()),
+                    "min":    _safe(s.min()),
+                    "max":    _safe(s.max()),
+                }
+        if "status" in sub.columns:
+            vc = sub["status"].value_counts().to_dict()
+            res["status"] = {str(k): int(v) for k, v in vc.items()}
+            total = len(sub)
+            res["alive_pct"] = round(100.0 * vc.get("Alive", 0) / total, 1) if total else 0.0
+            res["dead_pct"]  = round(100.0 * vc.get("Dead", 0) / total, 1) if total else 0.0
+        return res
+
+    def _hist(sub, colname, bins, labels):
+        if len(sub) == 0 or colname not in sub.columns:
+            return {lb: 0 for lb in labels}
+        return (pd.cut(pd.to_numeric(sub[colname], errors="coerce"),
+                       bins=bins, labels=labels, right=False)
+                .value_counts().reindex(labels).fillna(0).astype(int).to_dict())
+
+    age_bins   = [0, 30, 40, 50, 60, 70, 80, 200]
+    age_labels = ["<30", "30-39", "40-49", "50-59", "60-69", "70-79", "80+"]
+    sv_bins    = list(range(0, 121, 10))
+    sv_labels  = [f"{sv_bins[i]}-{sv_bins[i+1]-1}" for i in range(len(sv_bins) - 1)]
+
+    return {
+        "group_by": col,
+        "group_a": {
+            "label": payload.group_a,
+            "stats": _stats(a),
+            "age_hist": _hist(a, "age", age_bins, age_labels),
+            "survival_hist": _hist(a, "survival_months", sv_bins, sv_labels),
+        },
+        "group_b": {
+            "label": payload.group_b,
+            "stats": _stats(b),
+            "age_hist": _hist(b, "age", age_bins, age_labels),
+            "survival_hist": _hist(b, "survival_months", sv_bins, sv_labels),
+        },
+        "age_labels": age_labels,
+        "survival_labels": sv_labels,
+        "categories": sorted(d[col].dropna().astype(str).unique().tolist()),
+    }
+
+
 @app.post("/api/ml/train")
 def api_ml_train(force: bool = Query(False)):
     state = _train_all_models(force=force)
@@ -1376,7 +1565,7 @@ body{
         <div class="feat__ic">📊</div>
         <div>
           <div class="feat__t">Dashboard trực quan</div>
-          <div class="feat__d">8 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, ML…</div>
+          <div class="feat__d">10 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, nguy cơ, so sánh, ML…</div>
         </div>
       </div>
       <div class="feat">
@@ -1551,7 +1740,7 @@ $("formRegister").addEventListener("submit", async (e) => {
 
 
 # ==============================================================
-# 4b. DASHBOARD TEMPLATE — RỰC RỠ, BẮT MẮT
+# 4b. DASHBOARD TEMPLATE
 # ==============================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="vi" data-theme="dark">
@@ -1615,17 +1804,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
 
-/* ============================================================
-   AURORA BACKGROUND (rực rỡ)
-   ============================================================ */
 body{
   margin:0;font-family:var(--font);font-size:14px;line-height:1.55;color:var(--text);
   background:var(--bg);
   padding:22px 16px 60px;-webkit-font-smoothing:antialiased;
   position:relative;overflow-x:hidden;min-height:100vh;
 }
-
-/* Aurora gradient mesh */
 body::before{
   content:"";position:fixed;inset:-20%;z-index:-2;pointer-events:none;
   background:
@@ -1637,14 +1821,11 @@ body::before{
   animation:auroraShift 30s ease-in-out infinite alternate;
 }
 [data-theme="light"] body::before{opacity:.55;}
-
 @keyframes auroraShift{
   0%   {transform:translate(0,0) scale(1)}
   50%  {transform:translate(-3%,2%) scale(1.05)}
   100% {transform:translate(2%,-2%) scale(1.08)}
 }
-
-/* Subtle grid overlay */
 body::after{
   content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.35;
   background-image:
@@ -1654,8 +1835,6 @@ body::after{
   mask-image:radial-gradient(ellipse at center,black 35%,transparent 75%);
   -webkit-mask-image:radial-gradient(ellipse at center,black 35%,transparent 75%);
 }
-
-/* Floating orbs */
 .orb-field{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
 .orb-field span{position:absolute;border-radius:50%;filter:blur(70px);opacity:.5;
   animation:float 26s ease-in-out infinite}
@@ -1664,13 +1843,11 @@ body::after{
 .orb-field span:nth-child(3){width:320px;height:320px;background:radial-gradient(circle,#a855f7,#6b21a8);bottom:-120px;left:25%;animation-delay:-16s}
 .orb-field span:nth-child(4){width:280px;height:280px;background:radial-gradient(circle,#ec4899,#9d174d);bottom:20%;right:10%;animation-delay:-22s}
 [data-theme="light"] .orb-field span{opacity:.35}
-
 @keyframes float{
   0%,100%{transform:translate(0,0) scale(1)}
   33%{transform:translate(50px,-40px) scale(1.1)}
   66%{transform:translate(-40px,50px) scale(.94)}
 }
-
 h1,h2,h3,p{margin:0}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
@@ -1678,9 +1855,6 @@ button{cursor:pointer}
 
 .app{max-width:1340px;margin:0 auto;display:flex;flex-direction:column;gap:18px;position:relative;z-index:1}
 
-/* ============================================================
-   HEADER — glass rực rỡ
-   ============================================================ */
 .header{
   position:relative;overflow:hidden;
   background:linear-gradient(135deg,rgba(30,41,68,.7),rgba(17,24,45,.85));
@@ -1692,8 +1866,6 @@ button{cursor:pointer}
   display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap;
 }
 [data-theme="light"] .header{background:linear-gradient(135deg,rgba(255,255,255,.9),rgba(238,242,255,.85))}
-
-/* Rainbow border shine */
 .header::before{
   content:"";position:absolute;inset:0;border-radius:22px;padding:1px;
   background:linear-gradient(120deg,
@@ -1775,9 +1947,6 @@ button{cursor:pointer}
 .logout-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-soft);
   box-shadow:0 10px 22px -12px rgba(239,68,68,.6)}
 
-/* ============================================================
-   TABS — pill với indicator động
-   ============================================================ */
 .tabs{
   position:relative;
   display:flex;gap:5px;flex-wrap:wrap;
@@ -1818,9 +1987,6 @@ button{cursor:pointer}
   50%{opacity:1}
 }
 
-/* ============================================================
-   PANELS — glass rực rỡ
-   ============================================================ */
 .panel{
   position:relative;
   background:var(--surface);
@@ -1858,9 +2024,6 @@ button{cursor:pointer}
 .tabpanel{display:none;flex-direction:column;gap:18px}
 .tabpanel.is-active{display:flex;animation:panelIn .35s ease}
 
-/* ============================================================
-   STAT CARDS — gradient border, icon glow
-   ============================================================ */
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:14px}
 
 .stat{
@@ -1921,9 +2084,6 @@ button{cursor:pointer}
   -webkit-background-clip:text;background-clip:text;color:transparent;
 }
 
-/* ============================================================
-   CHART CARDS
-   ============================================================ */
 .chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px}
 .chart-grid.two{grid-template-columns:repeat(auto-fit,minmax(430px,1fr))}
 
@@ -1953,9 +2113,6 @@ button{cursor:pointer}
 .chart-wrap{position:relative;height:280px}
 .chart-wrap.tall{height:400px}
 
-/* ============================================================
-   TABLE
-   ============================================================ */
 .table-wrap{
   overflow:auto;border:1px solid var(--border);border-radius:14px;
   background:var(--surface-2);backdrop-filter:blur(10px);
@@ -1974,9 +2131,6 @@ table.dt tbody tr{transition:background var(--transition)}
 table.dt tbody tr:hover{background:rgba(99,102,241,.07)}
 table.dt td.mono{font-family:var(--mono)}
 
-/* ============================================================
-   FILTER
-   ============================================================ */
 .filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px}
 .filter-field label{
   display:block;font-size:11px;font-weight:700;color:var(--text-muted);
@@ -2005,9 +2159,6 @@ table.dt td.mono{font-family:var(--mono)}
   box-shadow:0 8px 20px -8px rgba(168,85,247,.7);
 }
 
-/* ============================================================
-   BUTTONS
-   ============================================================ */
 .btn{
   display:inline-flex;align-items:center;justify-content:center;gap:8px;
   padding:11px 19px;font-size:13px;font-weight:700;
@@ -2043,9 +2194,6 @@ table.dt td.mono{font-family:var(--mono)}
 }
 .btn--sm{padding:8px 14px;font-size:12px;border-radius:10px}
 
-/* ============================================================
-   PAGINATION
-   ============================================================ */
 .pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;
   margin-top:14px;flex-wrap:wrap}
 .pagination__info{font-size:12px;color:var(--text-muted)}
@@ -2061,9 +2209,6 @@ table.dt td.mono{font-family:var(--mono)}
 }
 .pg-btn:disabled{opacity:.4;cursor:not-allowed}
 
-/* ============================================================
-   WIZARD
-   ============================================================ */
 .wizard{display:flex;flex-direction:column;gap:22px}
 .steps{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;position:relative}
 .step{
@@ -2108,7 +2253,6 @@ table.dt td.mono{font-family:var(--mono)}
   padding-top:16px;border-top:1px solid var(--border);margin-top:16px;
 }
 
-/* Prediction result */
 .predict-result{
   border-radius:20px;padding:30px;text-align:center;
   animation:fadeUp .5s cubic-bezier(.4,0,.2,1);
@@ -2160,9 +2304,6 @@ table.dt td.mono{font-family:var(--mono)}
 }
 .predict-meta strong{color:var(--text)}
 
-/* ============================================================
-   SVM FORM
-   ============================================================ */
 .groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px;padding:22px 24px}
 .group{
   border:1px solid var(--border);border-radius:16px;padding:18px;
@@ -2314,9 +2455,6 @@ table.dt td.mono{font-family:var(--mono)}
 }
 .muted{color:var(--text-muted);font-size:12.5px}
 
-/* ============================================================
-   TOAST
-   ============================================================ */
 .toast-stack{position:fixed;top:22px;right:22px;z-index:9999;
   display:flex;flex-direction:column;gap:10px;pointer-events:none}
 .toast{
@@ -2339,18 +2477,12 @@ table.dt td.mono{font-family:var(--mono)}
 .toast--info::before{background:linear-gradient(180deg,#818cf8,#6366f1)}
 @keyframes slideIn{from{opacity:0;transform:translateX(28px)}to{opacity:1;transform:none}}
 
-/* ============================================================
-   SKELETON
-   ============================================================ */
 .skeleton{
   background:linear-gradient(90deg,var(--surface-3) 25%,var(--surface-2) 50%,var(--surface-3) 75%);
   background-size:200% 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:8px;
 }
 @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
 
-/* ============================================================
-   RESPONSIVE
-   ============================================================ */
 @media (max-width:768px){
   body{padding:14px 10px 40px}
   .header{padding:20px 18px;border-radius:18px}
@@ -2400,6 +2532,8 @@ table.dt td.mono{font-family:var(--mono)}
     <button class="tab" data-tab="disease">🩺 Bệnh &amp; Khối u</button>
     <button class="tab" data-tab="biology">🧬 Yếu tố sinh học</button>
     <button class="tab" data-tab="survival">⏱️ Phân tích sống còn</button>
+    <button class="tab" data-tab="risk">⚠️ Phân tích nguy cơ</button>
+    <button class="tab" data-tab="compare">👥 So sánh nhóm</button>
     <button class="tab" data-tab="predict">🤖 Dự đoán</button>
     <button class="tab" data-tab="svm">🧪 SVM 30 đặc trưng</button>
   </nav>
@@ -2656,6 +2790,150 @@ table.dt td.mono{font-family:var(--mono)}
   </section>
 
   <!-- ============================================================
+       🆕 TAB 6b — PHÂN TÍCH NGUY CƠ
+       ============================================================ -->
+  <section class="tabpanel" data-panel="risk">
+    <div class="panel">
+      <div class="panel__head">
+        <h2>⚠️ Phân tích nguy cơ (Risk Score)</h2>
+        <button class="btn btn--ghost btn--sm" data-refresh="risk">🔄</button>
+      </div>
+      <div class="panel__body">
+        <div class="stat-grid" id="riskStats"></div>
+        <div class="note" style="margin-top:16px">
+          <strong>Risk Score</strong> = 25% kích thước khối u + 35% số hạch dương tính
+          + 20% Grade + 20% N Stage (thang điểm 0 – 100).
+          <em>Low &lt; 25 · Medium &lt; 50 · High &lt; 75 · Very High ≥ 75.</em>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-grid two">
+      <div class="chart-card">
+        <div class="chart-card__title">📊 Phân bố Risk Score</div>
+        <div class="chart-card__desc">
+          Histogram điểm nguy cơ — cho thấy phần lớn bệnh nhân tập trung ở mức nào.
+        </div>
+        <div class="chart-wrap"><canvas id="riskHist"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">🎯 Mức độ nguy cơ</div>
+        <div class="chart-card__desc">
+          Tỉ lệ bệnh nhân theo 4 mức: Low / Medium / High / Very High.
+        </div>
+        <div class="chart-wrap"><canvas id="riskLevel"></canvas></div>
+      </div>
+    </div>
+
+    <div class="chart-grid two">
+      <div class="chart-card">
+        <div class="chart-card__title">🧬 Yếu tố nguy cơ — tương quan với Risk Score</div>
+        <div class="chart-card__desc">
+          Mức độ ảnh hưởng của từng yếu tố (Tumor Size, Node Positive, Grade…)
+          lên Risk Score. Càng gần ±1 thì ảnh hưởng càng mạnh.
+        </div>
+        <div class="chart-wrap"><canvas id="riskFactors"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">📈 Risk Score theo giai đoạn bệnh</div>
+        <div class="chart-card__desc">
+          Điểm nguy cơ trung bình cho từng giai đoạn (6th Stage) — giai đoạn cao → điểm cao.
+        </div>
+        <div class="chart-wrap"><canvas id="riskByStage"></canvas></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__head">
+        <h2>🚨 Top 10 bệnh nhân nguy cơ cao nhất</h2>
+      </div>
+      <div class="panel__body">
+        <div class="table-wrap" id="riskTable"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================
+       🆕 TAB 6c — SO SÁNH NHÓM
+       ============================================================ -->
+  <section class="tabpanel" data-panel="compare">
+    <div class="panel">
+      <div class="panel__head">
+        <h2>👥 So sánh 2 nhóm bệnh nhân</h2>
+      </div>
+      <div class="panel__body">
+        <div class="filter-grid">
+          <div class="filter-field">
+            <label>So sánh theo</label>
+            <select id="cmpGroupBy">
+              <option value="status">Status (Alive / Dead)</option>
+              <option value="stage_6th">Giai đoạn (6th Stage)</option>
+              <option value="estrogen_status">Estrogen Status</option>
+              <option value="progesterone_status">Progesterone Status</option>
+              <option value="n_stage">N Stage</option>
+              <option value="t_stage">T Stage</option>
+              <option value="grade">Grade</option>
+              <option value="race">Race</option>
+              <option value="marital_status">Marital Status</option>
+              <option value="differentiate">Differentiate</option>
+            </select>
+          </div>
+          <div class="filter-field">
+            <label>Nhóm A</label>
+            <select id="cmpGroupA"></select>
+          </div>
+          <div class="filter-field">
+            <label>Nhóm B</label>
+            <select id="cmpGroupB"></select>
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn--primary btn--sm" id="cmpRun">🔍 So sánh</button>
+          <button class="btn btn--ghost btn--sm" id="cmpSwap">⇄ Đổi nhóm</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="cmpSummaryPanel">
+      <div class="panel__head"><h2>📊 Kết quả so sánh</h2></div>
+      <div class="panel__body">
+        <div id="cmpSummary" class="muted">Chọn 2 nhóm và bấm <strong>So sánh</strong>.</div>
+      </div>
+    </div>
+
+    <div class="chart-grid two" id="cmpCharts" hidden>
+      <div class="chart-card">
+        <div class="chart-card__title">📊 Chỉ số trung bình — Nhóm A vs Nhóm B</div>
+        <div class="chart-card__desc">
+          So sánh trực tiếp Tuổi, Kích thước khối u, Hạch dương tính, Thời gian sống.
+        </div>
+        <div class="chart-wrap"><canvas id="cmpBars"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">💚 Alive / Dead theo nhóm</div>
+        <div class="chart-card__desc">
+          Tỉ lệ sống / tử vong của từng nhóm — cột chồng giúp so sánh trực quan.
+        </div>
+        <div class="chart-wrap"><canvas id="cmpPie"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">🎂 Phân bố độ tuổi</div>
+        <div class="chart-card__desc">
+          Histogram tuổi của 2 nhóm chồng lên nhau để thấy khác biệt về nhân khẩu.
+        </div>
+        <div class="chart-wrap"><canvas id="cmpAge"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">⏱️ Phân bố thời gian sống (tháng)</div>
+        <div class="chart-card__desc">
+          Histogram survival_months của 2 nhóm — nhóm nào sống lâu hơn thấy rõ.
+        </div>
+        <div class="chart-wrap"><canvas id="cmpSurv"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================
        TAB 7 — DỰ ĐOÁN (wizard 3 bước)
        ============================================================ -->
   <section class="tabpanel" data-panel="predict">
@@ -2770,7 +3048,7 @@ table.dt td.mono{font-family:var(--mono)}
 
 <script>
 /* ============================================================
-   PALETTE — mở rộng với gradient rực rỡ
+   PALETTE
    ============================================================ */
 const CLR = {
   blue:  "#6366f1", green: "#10b981", red: "#ef4444", gray: "#94a3b8",
@@ -2785,19 +3063,6 @@ const CLR = {
   pinkSoft:  "rgba(236,72,153,.75)",
 };
 
-const GRADIENTS = {
-  blue:   ["#818cf8","#6366f1"],
-  green:  ["#34d399","#10b981"],
-  red:    ["#f87171","#ef4444"],
-  cyan:   ["#22d3ee","#06b6d4"],
-  purple: ["#c084fc","#a855f7"],
-  pink:   ["#f472b6","#ec4899"],
-  amber:  ["#fbbf24","#f59e0b"],
-};
-
-/* ============================================================
-   CONFIG
-   ============================================================ */
 const CONFIG = { API_URL:"/predict", HEALTH_URL:"/health", REQUEST_TIMEOUT_MS:15000 };
 
 const FEATURE_GROUPS = [
@@ -2898,6 +3163,8 @@ const Api = (() => {
     disease:  (p) => post("/api/analysis/disease", p),
     biology:  (p) => post("/api/analysis/biology", p),
     survival: (p) => post("/api/analysis/survival", p),
+    risk:     (p) => post("/api/analysis/risk", p),        // 🆕
+    compare:  (p) => post("/api/analysis/compare", p),     // 🆕
     train:    () => post("/api/ml/train", {}),
     mlPredict:(p) => post("/api/ml/predict", p),
     me:       () => request("/api/auth/me"),
@@ -2906,7 +3173,7 @@ const Api = (() => {
 })();
 
 /* ============================================================
-   CHART REGISTRY — với gradient helpers
+   CHART REGISTRY
    ============================================================ */
 const Charts = (() => {
   const registry = {};
@@ -2919,7 +3186,6 @@ const Charts = (() => {
     const el = document.getElementById(id);
     if (!el) return null;
     destroy(id);
-    // Tự động bật gradient nếu dataset có backgroundColor dạng chuỗi gradient key
     registry[id] = new Chart(el.getContext("2d"), cfg);
     return registry[id];
   }
@@ -3143,7 +3409,6 @@ const Dashboard = (() => {
         statCard("❤️", "Dead", d.dead, "red") +
         statCard("⏳", "Thời gian sống TB", num(d.avg_survival, 1) + " th", "gray");
 
-      // Doughnut với gradient rực rỡ
       Charts.make("ovStatus", {
         type:"doughnut",
         data:{
@@ -3175,7 +3440,6 @@ const Dashboard = (() => {
       });
 
       const stageKeys = Object.keys(d.stage_distribution || {}).sort();
-      // Gradient background cho bar
       const ctx = document.getElementById("ovStage")?.getContext("2d");
       let grad = CLR.blue;
       if (ctx) {
@@ -3301,7 +3565,6 @@ const Dashboard = (() => {
         statCard("⬇️","Tuổi thấp nhất", num(d.age_stats.min, 0), "gray") +
         statCard("⬆️","Tuổi cao nhất", num(d.age_stats.max, 0), "gray");
 
-      // Bar với gradient cyan→blue
       const c1 = document.getElementById("ptAge")?.getContext("2d");
       let g1 = CLR.blue;
       if (c1) { g1 = c1.createLinearGradient(0,0,0,280);
@@ -3314,7 +3577,6 @@ const Dashboard = (() => {
         options:Charts.baseOpts()
       });
 
-      // Bar purple
       const c2 = document.getElementById("ptRace")?.getContext("2d");
       let g2 = CLR.purple;
       if (c2) { g2 = c2.createLinearGradient(0,0,0,280);
@@ -3327,7 +3589,6 @@ const Dashboard = (() => {
         options:Charts.baseOpts()
       });
 
-      // Horizontal pink→purple
       const c3 = document.getElementById("ptMarital")?.getContext("2d");
       let g3 = CLR.pink;
       if (c3) { g3 = c3.createLinearGradient(0,0,400,0);
@@ -3543,18 +3804,15 @@ const Dashboard = (() => {
             type:"matrix",
             data:{datasets:[{
               data:pts,
-              // Gradient theo dải giá trị: đỏ ↔ tím ↔ xanh
               backgroundColor:(c) => {
                 const v = c.raw?.v ?? 0;
                 const a = Math.min(1, Math.abs(v));
                 if (v >= 0) {
-                  // Từ xanh lá (yếu) → cyan → indigo (mạnh)
                   const r = Math.round(16  + (99-16)  * a);
                   const g = Math.round(185 + (102-185)* a);
                   const b = Math.round(129 + (241-129)* a);
                   return `rgba(${r},${g},${b},${0.2 + 0.75*a})`;
                 } else {
-                  // Đỏ → hồng → tím
                   const r = Math.round(239 + (236-239)* a);
                   const g = Math.round(68  + (72-68)  * a);
                   const b = Math.round(68  + (153-68)* a);
@@ -3589,6 +3847,203 @@ const Dashboard = (() => {
     } catch(e) { $("svStats").innerHTML = `<div class="alert">${e.message}</div>`; }
   }
 
+  /* ============================================================
+     🆕 RISK ANALYSIS — Phân tích nguy cơ
+     ============================================================ */
+  async function loadRisk() {
+    try {
+      const d = await Api.risk({filters: state.filters});
+
+      $("riskStats").innerHTML =
+        statCard("⚠️","Tổng", d.total, "blue") +
+        statCard("📈","Risk TB", num(d.risk_stats?.mean, 1), "red") +
+        statCard("📊","Trung vị", num(d.risk_stats?.median, 1), "gray") +
+        statCard("⬆️","Cao nhất", num(d.risk_stats?.max, 1), "red");
+
+      const cH = document.getElementById("riskHist")?.getContext("2d");
+      let gH = CLR.red;
+      if (cH) { gH = cH.createLinearGradient(0,0,0,280);
+        gH.addColorStop(0,"#fbbf24"); gH.addColorStop(.5,"#f87171"); gH.addColorStop(1,"#dc2626"); }
+      Charts.make("riskHist", {
+        type:"bar",
+        data:{labels:Object.keys(d.risk_hist || {}),
+          datasets:[{label:"Số bệnh nhân", data:Object.values(d.risk_hist || {}),
+            backgroundColor:gH, borderRadius:8, borderSkipped:false, maxBarThickness:46}]},
+        options:Charts.baseOpts()
+      });
+
+      const levelOrder  = ["Low","Medium","High","Very High"];
+      const levelColors = ["#10b981","#f59e0b","#f97316","#ef4444"];
+      const levelLabels = levelOrder.filter(l => (d.level_dist||{})[l] !== undefined);
+      Charts.make("riskLevel", {
+        type:"doughnut",
+        data:{labels: levelLabels,
+          datasets:[{data: levelLabels.map(l => d.level_dist[l]),
+            backgroundColor: levelColors.slice(0, levelLabels.length),
+            borderWidth:0, hoverOffset:10, spacing:2}]},
+        options:{responsive:true, maintainAspectRatio:false, cutout:"66%",
+          plugins:{legend:{position:"bottom", labels:{color:Charts.textColor(),
+            padding:14, usePointStyle:true, pointStyle:"circle", boxWidth:9, boxHeight:9}}}}
+      });
+
+      const fc = (d.factor_correlation || []).slice().sort((a,b) => Math.abs(b.correlation)-Math.abs(a.correlation));
+      const fLabels = fc.map(x => x.factor.replace(/_/g," "));
+      const fVals   = fc.map(x => x.correlation);
+      const fColors = fVals.map(v => v >= 0 ? "rgba(239,68,68,.85)" : "rgba(16,185,129,.85)");
+      Charts.make("riskFactors", {
+        type:"bar",
+        data:{labels: fLabels,
+          datasets:[{label:"Tương quan với Risk Score", data: fVals,
+            backgroundColor: fColors, borderRadius:8, borderSkipped:false, maxBarThickness:32}]},
+        options:{...Charts.baseOpts(), indexAxis:"y",
+          scales:{x:{min:-1,max:1,ticks:{color:Charts.textColor()},grid:{color:Charts.gridColor()}},
+                  y:{ticks:{color:Charts.textColor()},grid:{display:false}}}}
+      });
+
+      const stages = Object.keys(d.risk_by_stage || {}).sort();
+      const cS = document.getElementById("riskByStage")?.getContext("2d");
+      let gS = CLR.purple;
+      if (cS) { gS = cS.createLinearGradient(0,0,0,280);
+        gS.addColorStop(0,"#c084fc"); gS.addColorStop(1,"#7c3aed"); }
+      Charts.make("riskByStage", {
+        type:"bar",
+        data:{labels: stages,
+          datasets:[{label:"Risk Score TB", data: stages.map(s => d.risk_by_stage[s]),
+            backgroundColor: gS, borderRadius:8, borderSkipped:false, maxBarThickness:54}]},
+        options:Charts.baseOpts()
+      });
+
+      const cols = ["age","tumor_size","n_stage","grade","regional_node_positive",
+                    "risk_score","risk_level","status"];
+      buildTable("riskTable", cols, d.top_risk_patients || []);
+    } catch(e) {
+      $("riskStats").innerHTML = `<div class="alert">${e.message}</div>`;
+    }
+  }
+
+  /* ============================================================
+     🆕 GROUP COMPARISON — So sánh nhóm
+     ============================================================ */
+  async function loadCompare() {
+    async function refreshOptions() {
+      const col = $("cmpGroupBy").value;
+      try {
+        const meta = await Api.meta();
+        const cats = (meta.categories || {})[col] || [];
+        const a = $("cmpGroupA"), b = $("cmpGroupB");
+        a.innerHTML = cats.map(c => `<option value="${c}">${c}</option>`).join("");
+        b.innerHTML = cats.map(c => `<option value="${c}">${c}</option>`).join("");
+        if (cats.length >= 2) { b.selectedIndex = 1; }
+      } catch(e) {
+        Toast.show("Không tải được danh mục: " + e.message, "err");
+      }
+    }
+    await refreshOptions();
+
+    if (state._cmpBound) return;
+    state._cmpBound = true;
+
+    $("cmpGroupBy").addEventListener("change", () => refreshOptions());
+    $("cmpSwap").addEventListener("click", () => {
+      const a = $("cmpGroupA"), b = $("cmpGroupB");
+      const ta = a.value; a.value = b.value; b.value = ta;
+    });
+    $("cmpRun").addEventListener("click", runCompare);
+  }
+
+  async function runCompare() {
+    const group_by = $("cmpGroupBy").value;
+    const a = $("cmpGroupA").value;
+    const b = $("cmpGroupB").value;
+    if (!a || !b) return Toast.show("Vui lòng chọn 2 nhóm.", "err");
+    if (a === b)   return Toast.show("Hai nhóm phải khác nhau.", "err");
+
+    $("cmpSummary").innerHTML = "⏳ Đang tính toán…";
+    $("cmpCharts").hidden = true;
+
+    try {
+      const d = await Api.compare({filters: state.filters, group_by, group_a: a, group_b: b});
+      const A = d.group_a.stats, B = d.group_b.stats;
+
+      const row = (label, va, vb, fmt="2") => {
+        const na = (va===null||va===undefined) ? "—" : Number(va).toFixed(fmt);
+        const nb = (vb===null||vb===undefined) ? "—" : Number(vb).toFixed(fmt);
+        return `<div class="meta__row"><span class="meta__key">${label}</span>
+                <span class="meta__val">A: ${na} &nbsp;·&nbsp; B: ${nb}</span></div>`;
+      };
+      $("cmpSummary").innerHTML = `
+        <div class="meta" style="max-width:760px">
+          <div class="meta__row"><span class="meta__key"><strong>So sánh theo</strong></span>
+              <span class="meta__val">A: ${d.group_a.label} &nbsp;·&nbsp; B: ${d.group_b.label}</span></div>
+          ${row("Số bệnh nhân (n)", A.n, B.n, 0)}
+          ${row("Tuổi TB", A.age?.mean, B.age?.mean, 1)}
+          ${row("Kích thước khối u TB (mm)", A.tumor_size?.mean, B.tumor_size?.mean, 1)}
+          ${row("Hạch dương tính TB", A.regional_node_positive?.mean, B.regional_node_positive?.mean, 2)}
+          ${row("Thời gian sống TB (tháng)", A.survival_months?.mean, B.survival_months?.mean, 1)}
+          ${row("Alive (%)", A.alive_pct, B.alive_pct, 1)}
+          ${row("Dead (%)",  A.dead_pct,  B.dead_pct,  1)}
+        </div>`;
+      $("cmpCharts").hidden = false;
+
+      Charts.make("cmpBars", {
+        type:"bar",
+        data:{labels:["Tuổi","Tumor Size","Node Positive","Survival Months"],
+          datasets:[
+            {label:`A · ${d.group_a.label}`,
+             data:[A.age?.mean||0, A.tumor_size?.mean||0, A.regional_node_positive?.mean||0, A.survival_months?.mean||0],
+             backgroundColor:"rgba(99,102,241,.85)", borderRadius:8, borderSkipped:false, maxBarThickness:46},
+            {label:`B · ${d.group_b.label}`,
+             data:[B.age?.mean||0, B.tumor_size?.mean||0, B.regional_node_positive?.mean||0, B.survival_months?.mean||0],
+             backgroundColor:"rgba(236,72,153,.85)", borderRadius:8, borderSkipped:false, maxBarThickness:46},
+          ]},
+        options:Charts.baseOpts()
+      });
+
+      Charts.make("cmpPie", {
+        type:"bar",
+        data:{labels:[`A · ${d.group_a.label}`, `B · ${d.group_b.label}`],
+          datasets:[
+            {label:"Alive", data:[A.alive_pct||0, B.alive_pct||0],
+             backgroundColor:"#10b981", borderRadius:{topLeft:0, topRight:0}, maxBarThickness:70},
+            {label:"Dead",  data:[A.dead_pct||0, B.dead_pct||0],
+             backgroundColor:"#ef4444", borderRadius:{topLeft:8, topRight:8}, maxBarThickness:70},
+          ]},
+        options:{...Charts.baseOpts(),
+          scales:{x:{stacked:true, ticks:{color:Charts.textColor()}, grid:{display:false}},
+                  y:{stacked:true, ticks:{color:Charts.textColor(), callback:v=>v+"%"},
+                     grid:{color:Charts.gridColor()}, beginAtZero:true, max:100}}}
+      });
+
+      Charts.make("cmpAge", {
+        type:"bar",
+        data:{labels: d.age_labels,
+          datasets:[
+            {label:`A · ${d.group_a.label}`, data: d.age_labels.map(l => d.group_a.age_hist[l] || 0),
+             backgroundColor:"rgba(99,102,241,.8)", borderRadius:6, maxBarThickness:30},
+            {label:`B · ${d.group_b.label}`, data: d.age_labels.map(l => d.group_b.age_hist[l] || 0),
+             backgroundColor:"rgba(236,72,153,.8)", borderRadius:6, maxBarThickness:30},
+          ]},
+        options:Charts.baseOpts()
+      });
+
+      Charts.make("cmpSurv", {
+        type:"bar",
+        data:{labels: d.survival_labels,
+          datasets:[
+            {label:`A · ${d.group_a.label}`, data: d.survival_labels.map(l => d.group_a.survival_hist[l] || 0),
+             backgroundColor:"rgba(6,182,212,.8)", borderRadius:6, maxBarThickness:24},
+            {label:`B · ${d.group_b.label}`, data: d.survival_labels.map(l => d.group_b.survival_hist[l] || 0),
+             backgroundColor:"rgba(168,85,247,.8)", borderRadius:6, maxBarThickness:24},
+          ]},
+        options:Charts.baseOpts()
+      });
+
+      Toast.show("So sánh hoàn tất.", "ok");
+    } catch(e) {
+      $("cmpSummary").innerHTML = `<div class="alert">${e.message}</div>`;
+    }
+  }
+
   async function ensureModel() {
     try { return await Api.train(); } catch(e) { return null; }
   }
@@ -3601,6 +4056,8 @@ const Dashboard = (() => {
       else if (name === "disease") { await loadDisease(); }
       else if (name === "biology") { await loadBiology(); }
       else if (name === "survival") { await loadSurvival(); }
+      else if (name === "risk")     { await loadRisk(); }       // 🆕
+      else if (name === "compare")  { await loadCompare(); }    // 🆕
       else if (name === "predict") { await ensureModel(); }
     } catch(e) { console.error("[load]", name, e); }
   }
