@@ -640,7 +640,7 @@ CLASS_LABELS = ["malignant", "benign"]
 app = FastAPI(
     title="Breast Cancer Analytics API",
     description="Dashboard phân tích sống còn + SVM chẩn đoán 30 đặc trưng. Có bảo mật SQL.",
-    version="3.2.0",
+    version="3.2.1",
 )
 
 app.add_middleware(
@@ -1119,11 +1119,20 @@ def api_survival(payload: FilterPayload):
 # 3e. KAPLAN-MEIER SURVIVAL CURVE
 # ==============================================================
 def _kaplan_meier(times, events):
-    """Tính đường cong Kaplan–Meier (events: 1=dead, 0=censored/alive)."""
-    df = pd.DataFrame({
-        "t": pd.to_numeric(times, errors="coerce"),
-        "e": pd.to_numeric(events, errors="coerce").fillna(0).astype(int),
-    }).dropna(subset=["t"]).sort_values("t")
+    """Tính đường cong Kaplan–Meier (events: 1=dead, 0=censored/alive).
+
+    CHÚ Ý: times và events thường là numpy array (kết quả của phép slicing
+    trên DataFrame/Series). KHÔNG được gọi trực tiếp .fillna() lên kết quả
+    của pd.to_numeric(numpy_array, errors="coerce") vì nó trả về numpy array
+    — numpy array không có method .fillna() → AttributeError → HTTP 500.
+    → Bắt buộc bọc qua pd.Series() trước khi dùng các API pandas.
+    """
+    t_series = pd.Series(np.asarray(times, dtype="float64"))
+    e_series = pd.Series(np.asarray(events, dtype="float64")).fillna(0).astype(int)
+
+    df = pd.DataFrame({"t": t_series.values, "e": e_series.values})
+    df = df.dropna(subset=["t"]).sort_values("t").reset_index(drop=True)
+
     if len(df) == 0:
         return [0.0], [1.0]
 
@@ -2538,7 +2547,7 @@ table.dt td.mono{font-family:var(--mono)}
             Breast Cancer Analytics
           </h1>
           <p class="muted" style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:26px">
-            Clinical Intelligence Suite · v3.2
+            Clinical Intelligence Suite · v3.2.1
           </p>
 
           <p style="font-size:15.5px;color:var(--text-muted)">
