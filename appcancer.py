@@ -463,6 +463,7 @@ _ml_state: Dict[str, Any] = {
     "trained": False, "metrics": {}, "models": {}, "scaler": None,
     "encoders": {}, "feature_names": [], "X_test": None, "y_test": None,
     "y_pred": {}, "y_prob": {}, "error": None,
+    "train_size": 0, "test_size": 0,
 }
 
 
@@ -491,30 +492,48 @@ def _train_all_models(force: bool = False) -> Dict[str, Any]:
         y_pred_map: Dict[str, Any] = {}
         y_prob_map: Dict[str, Any] = {}
 
+        train_size = int(len(X_tr))
+        test_size  = int(len(X_te))
+
         for name, mdl in candidates.items():
             if name == "Logistic Regression":
                 mdl.fit(X_tr_s, y_tr)
-                y_pred = mdl.predict(X_te_s)
-                y_prob = mdl.predict_proba(X_te_s)[:, 1]
+                y_pred   = mdl.predict(X_te_s)
+                y_prob   = mdl.predict_proba(X_te_s)[:, 1]
+                y_pred_tr = mdl.predict(X_tr_s)
+                y_prob_tr = mdl.predict_proba(X_tr_s)[:, 1]
             else:
                 mdl.fit(X_tr, y_tr)
-                y_pred = mdl.predict(X_te)
-                y_prob = mdl.predict_proba(X_te)[:, 1]
+                y_pred   = mdl.predict(X_te)
+                y_prob   = mdl.predict_proba(X_te)[:, 1]
+                y_pred_tr = mdl.predict(X_tr)
+                y_prob_tr = mdl.predict_proba(X_tr)[:, 1]
 
             cm = confusion_matrix(y_te, y_pred).tolist()
+            cm_tr = confusion_matrix(y_tr, y_pred_tr).tolist()
             fpr, tpr, _ = roc_curve(y_te, y_prob)
             roc_auc = auc(fpr, tpr)
+            fpr_tr, tpr_tr, _ = roc_curve(y_tr, y_prob_tr)
+            roc_auc_tr = auc(fpr_tr, tpr_tr)
 
             metrics[name] = {
-                "accuracy": round(float(accuracy_score(y_te, y_pred)), 4),
+                "accuracy":  round(float(accuracy_score(y_te, y_pred)), 4),
                 "precision": round(float(precision_score(y_te, y_pred, zero_division=0)), 4),
-                "recall": round(float(recall_score(y_te, y_pred, zero_division=0)), 4),
-                "f1": round(float(f1_score(y_te, y_pred, zero_division=0)), 4),
-                "auc": round(float(roc_auc), 4),
+                "recall":    round(float(recall_score(y_te, y_pred, zero_division=0)), 4),
+                "f1":        round(float(f1_score(y_te, y_pred, zero_division=0)), 4),
+                "auc":       round(float(roc_auc), 4),
                 "confusion_matrix": cm,
                 "roc": {
                     "fpr": [round(float(x), 4) for x in fpr[::max(1, len(fpr)//40)]],
                     "tpr": [round(float(x), 4) for x in tpr[::max(1, len(tpr)//40)]],
+                },
+                "train": {
+                    "accuracy":  round(float(accuracy_score(y_tr, y_pred_tr)), 4),
+                    "precision": round(float(precision_score(y_tr, y_pred_tr, zero_division=0)), 4),
+                    "recall":    round(float(recall_score(y_tr, y_pred_tr, zero_division=0)), 4),
+                    "f1":        round(float(f1_score(y_tr, y_pred_tr, zero_division=0)), 4),
+                    "auc":       round(float(roc_auc_tr), 4),
+                    "confusion_matrix": cm_tr,
                 },
             }
             y_pred_map[name] = y_pred.tolist()
@@ -534,6 +553,8 @@ def _train_all_models(force: bool = False) -> Dict[str, Any]:
             "y_pred": y_pred_map, "y_prob": y_prob_map,
             "feature_importance": importances,
             "class_balance": {"alive": int((y == 0).sum()), "dead": int((y == 1).sum())},
+            "train_size": train_size,
+            "test_size":  test_size,
             "error": None,
         })
     except Exception as exc:
@@ -640,7 +661,7 @@ CLASS_LABELS = ["malignant", "benign"]
 app = FastAPI(
     title="Breast Cancer Analytics API",
     description="Dashboard phân tích sống còn + SVM chẩn đoán 30 đặc trưng. Có bảo mật SQL.",
-    version="3.2.1",
+    version="3.3.0",
 )
 
 app.add_middleware(
@@ -1281,6 +1302,84 @@ def api_compare(payload: ComparePayload):
     }
 
 
+# ==============================================================
+# 3g. CORRELATION & FEATURES — Tương quan & đặc trưng
+# ==============================================================
+@app.post("/api/analysis/correlation-features")
+def api_correlation_features(payload: FilterPayload):
+    """Tương quan & đặc trưng: heatmap, top feature, phân bố, so sánh Alive/Dead."""
+    if _df is None:
+        raise HTTPException(status_code=503, detail="Dataset chưa sẵn sàng.")
+    d = _apply_filters(_df, payload.filters)
+    numeric_df = d.select_dtypes(include=[np.number])
+
+    if numeric_df.empty:
+        return {"correlation": {}, "columns": [], "top_features": [],
+                "distributions": {}, "alive_dead": {}, "total": 0,
+                "feature_importance": []}
+
+    corr = numeric_df.corr().round(3).fillna(0).to_dict()
+
+    # Top 10 đặc trưng tương quan mạnh nhất với survival_months
+    target_col = "survival_months"
+    top_features = []
+    if target_col in numeric_df.columns:
+        corr_with_target = numeric_df.corr()[target_col].drop(target_col)
+        ranked = corr_with_target.abs().sort_values(ascending=False)
+        top_features = [
+            {"feature": k, "correlation": round(float(corr_with_target[k]), 4),
+             "abs_correlation": round(float(v), 4)}
+            for k, v in ranked.head(10).items()
+        ]
+
+    # Phân bố (histogram 10 bins) cho top 6
+    distributions = {}
+    for f in top_features[:6]:
+        col = f["feature"]
+        s = numeric_df[col].dropna()
+        if len(s) == 0:
+            continue
+        try:
+            counts, edges = np.histogram(s, bins=10)
+            distributions[col] = {
+                "labels": [f"{edges[i]:.1f}–{edges[i+1]:.1f}" for i in range(len(edges) - 1)],
+                "counts": [int(c) for c in counts],
+                "mean":   _safe(s.mean()),
+                "median": _safe(s.median()),
+                "std":    _safe(s.std()),
+            }
+        except Exception:
+            continue
+
+    # So sánh Alive vs Dead cho từng numeric feature
+    alive_dead = {}
+    if "status" in d.columns:
+        alive = d[d["status"] == "Alive"]
+        dead  = d[d["status"] == "Dead"]
+        for col in numeric_df.columns:
+            sa = pd.to_numeric(alive[col], errors="coerce").dropna()
+            sd = pd.to_numeric(dead[col], errors="coerce").dropna()
+            alive_dead[col] = {
+                "alive_mean": _safe(sa.mean()),
+                "dead_mean":  _safe(sd.mean()),
+                "alive_n":    int(len(sa)),
+                "dead_n":     int(len(sd)),
+            }
+
+    # Feature importance từ mô hình Random Forest đã train (nếu có)
+    feat_importance = _ml_state.get("feature_importance", []) if _ml_state.get("trained") else []
+
+    return {
+        "correlation":  corr,
+        "columns":      numeric_df.columns.tolist(),
+        "top_features": top_features,
+        "distributions": distributions,
+        "alive_dead":   alive_dead,
+        "feature_importance": feat_importance,
+        "total":        int(len(d)),
+    }
+
+
 @app.post("/api/ml/train")
 def api_ml_train(force: bool = Query(False)):
     state = _train_all_models(force=force)
@@ -1306,6 +1405,42 @@ def api_ml_metrics():
         "class_balance": _ml_state.get("class_balance", {}),
         "feature_importance": _ml_state.get("feature_importance", []),
         "feature_names": _ml_state.get("feature_names", []),
+    }
+
+
+@app.get("/api/ml/evaluation")
+def api_ml_evaluation():
+    """Đánh giá chi tiết mô hình: metrics test/train, confusion, ROC, so sánh overfit."""
+    if not _ml_state["trained"]:
+        _train_all_models()
+    if _ml_state.get("error"):
+        raise HTTPException(status_code=500, detail=_ml_state["error"])
+
+    models_data = []
+    for name, m in _ml_state["metrics"].items():
+        test_m  = {k: v for k, v in m.items() if k != "train"}
+        train_m = m.get("train", {})
+        models_data.append({
+            "name":  name,
+            "test":  test_m,
+            "train": train_m,
+            "overfit": {
+                "accuracy_gap": round(test_m.get("accuracy", 0) - train_m.get("accuracy", 0), 4),
+                "auc_gap":      round(test_m.get("auc", 0) - train_m.get("auc", 0), 4),
+            },
+        })
+
+    ranked = sorted(models_data, key=lambda x: -x["test"]["auc"])
+    best = ranked[0]["name"] if ranked else None
+
+    return {
+        "models":            models_data,
+        "best_model":        best,
+        "class_balance":     _ml_state.get("class_balance", {}),
+        "train_size":        _ml_state.get("train_size", 0),
+        "test_size":         _ml_state.get("test_size", 0),
+        "feature_importance": _ml_state.get("feature_importance", []),
+        "feature_names":     _ml_state.get("feature_names", []),
     }
 
 
@@ -1552,14 +1687,14 @@ body{
         <div class="feat__ic">📊</div>
         <div>
           <div class="feat__t">Dashboard trực quan</div>
-          <div class="feat__d">10 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, Kaplan-Meier, ML…</div>
+          <div class="feat__d">12 tab phân tích: bệnh nhân, khối u, sinh học, sống còn, Kaplan-Meier, ML, đánh giá…</div>
         </div>
       </div>
       <div class="feat">
         <div class="feat__ic">🧪</div>
         <div>
           <div class="feat__t">SVM + 4 mô hình ML</div>
-          <div class="feat__d">Logistic, RF, Gradient Boosting, Decision Tree — so sánh AUC tức thời.</div>
+          <div class="feat__d">Logistic, RF, Gradient Boosting, Decision Tree — so sánh AUC, ROC, Confusion Matrix.</div>
         </div>
       </div>
     </div>
@@ -1715,7 +1850,6 @@ $("formRegister").addEventListener("submit", async (e) => {
   try {
     await call("/api/auth/register", body, $("btnRegister"), $("regTxt"), "Đang tạo…");
     msg("Tạo tài khoản thành công. Vui lòng đăng nhập.", "ok");
-    // Chuyển về tab đăng nhập, điền sẵn username
     setTimeout(() => {
       $("loginUser").value = body.username;
       $("loginPass").value = "";
@@ -2074,6 +2208,10 @@ button{cursor:pointer}
 }
 .stat__value.gray{
   background:linear-gradient(135deg,#cbd5e1,#94a3b8);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.stat__value.purple{
+  background:linear-gradient(135deg,#c084fc,#a855f7);
   -webkit-background-clip:text;background-clip:text;color:transparent;
 }
 
@@ -2521,6 +2659,7 @@ table.dt td.mono{font-family:var(--mono)}
   <nav class="tabs" id="tabs">
     <button class="tab is-active" data-tab="overview">🏠 Trang Tổng quan</button>
     <button class="tab" data-tab="data">🔍 Khám phá dữ liệu</button>
+    <button class="tab" data-tab="corrfeat">🔥 Tương quan &amp; đặc trưng</button>
     <button class="tab" data-tab="patients">👤 Đặc điểm bệnh nhân</button>
     <button class="tab" data-tab="disease">🩺 Bệnh &amp; Khối u</button>
     <button class="tab" data-tab="biology">🧬 Yếu tố sinh học</button>
@@ -2528,6 +2667,7 @@ table.dt td.mono{font-family:var(--mono)}
     <button class="tab" data-tab="km">📈 Kaplan–Meier</button>
     <button class="tab" data-tab="compare">👥 So sánh nhóm</button>
     <button class="tab" data-tab="predict">🤖 Dự đoán</button>
+    <button class="tab" data-tab="eval">📊 Đánh giá mô hình</button>
     <button class="tab" data-tab="svm">🧪 SVM 30 đặc trưng</button>
   </nav>
 
@@ -2547,7 +2687,7 @@ table.dt td.mono{font-family:var(--mono)}
             Breast Cancer Analytics
           </h1>
           <p class="muted" style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:26px">
-            Clinical Intelligence Suite · v3.2.1
+            Clinical Intelligence Suite · v3.3.0
           </p>
 
           <p style="font-size:15.5px;color:var(--text-muted)">
@@ -2559,9 +2699,11 @@ table.dt td.mono{font-family:var(--mono)}
           <p style="font-size:15.5px;color:var(--text-muted);margin-top:16px">
             Hệ thống tích hợp <strong style="color:var(--text)">phân tích thống kê mô tả</strong>,
             <strong style="color:var(--text)">đường cong sống còn Kaplan–Meier</strong>,
-            <strong style="color:var(--text)">so sánh nhóm</strong>, và
+            <strong style="color:var(--text)">so sánh nhóm</strong>,
+            <strong style="color:var(--text)">tương quan &amp; đặc trưng</strong>, và
             <strong style="color:var(--text)">5 mô hình học máy</strong> (Logistic, Random Forest,
-            Gradient Boosting, Decision Tree, SVM 30 đặc trưng).
+            Gradient Boosting, Decision Tree, SVM 30 đặc trưng) kèm đánh giá toàn diện
+            (ROC, AUC, Confusion Matrix).
           </p>
 
           <h3 style="margin-top:34px;font-size:16px;color:var(--text);
@@ -2570,13 +2712,15 @@ table.dt td.mono{font-family:var(--mono)}
           </h3>
           <ul style="margin:14px 0 0;padding-left:24px;color:var(--text-muted);line-height:2.1;font-size:14.5px">
             <li><strong style="color:var(--text)">🔍 Khám phá dữ liệu</strong> — lọc, sắp xếp, tìm kiếm toàn bộ bảng dữ liệu.</li>
+            <li><strong style="color:var(--text)">🔥 Tương quan &amp; đặc trưng</strong> — heatmap, top 10, feature importance, phân bố.</li>
             <li><strong style="color:var(--text)">👤 Đặc điểm bệnh nhân</strong> — nhân khẩu học: tuổi, chủng tộc, hôn nhân.</li>
             <li><strong style="color:var(--text)">🩺 Bệnh &amp; Khối u</strong> — giai đoạn, kích thước, grade, biệt hoá.</li>
             <li><strong style="color:var(--text)">🧬 Yếu tố sinh học</strong> — estrogen, progesterone, hạch bạch huyết.</li>
             <li><strong style="color:var(--text)">⏱️ Phân tích sống còn</strong> — histogram, boxplot, scatter, ma trận tương quan.</li>
             <li><strong style="color:var(--text)">📈 Kaplan–Meier</strong> — đường cong sống còn theo nhóm (Race, Stage, Grade…).</li>
             <li><strong style="color:var(--text)">👥 So sánh nhóm</strong> — đối chiếu trực tiếp 2 nhóm bệnh nhân.</li>
-            <li><strong style="color:var(--text)">🤖 Dự đoán</strong> — 4 mô hình ML với AUC so sánh tức thời.</li>
+            <li><strong style="color:var(--text)">🤖 Dự đoán</strong> — 4 mô hình ML với điểm tin cậy dự đoán.</li>
+            <li><strong style="color:var(--text)">📊 Đánh giá mô hình</strong> — ROC, AUC, Confusion Matrix, so sánh Train/Test.</li>
             <li><strong style="color:var(--text)">🧪 SVM 30 đặc trưng</strong> — chẩn đoán malignant / benign.</li>
           </ul>
 
@@ -2620,6 +2764,69 @@ table.dt td.mono{font-family:var(--mono)}
             <button class="pg-btn" id="pgNext">Sau ›</button>
           </div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================
+       TAB 2b — TƯƠNG QUAN & ĐẶC TRƯNG
+       ============================================================ -->
+  <section class="tabpanel" data-panel="corrfeat">
+    <div class="panel">
+      <div class="panel__head">
+        <h2>🔥 Tương quan &amp; đặc trưng</h2>
+        <button class="btn btn--ghost btn--sm" data-refresh="corrfeat">🔄</button>
+      </div>
+      <div class="panel__body">
+        <div class="note" style="margin-bottom:14px">
+          Khám phá mối liên hệ giữa các biến số và thời gian sống. Giá trị tương quan càng gần
+          <strong>+1</strong> hoặc <strong>−1</strong> thì mối liên hệ càng mạnh.
+        </div>
+        <div class="stat-grid" id="cfStats"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__head"><h2>🌈 Heatmap tương quan</h2></div>
+      <div class="panel__body">
+        <div class="chart-card" style="padding:10px">
+          <div class="chart-wrap tall"><canvas id="cfHeatmap"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-grid two">
+      <div class="chart-card">
+        <div class="chart-card__title">🏆 Top 10 đặc trưng tương quan mạnh nhất với Survival Months</div>
+        <div class="chart-card__desc">
+          Cột dương = tương quan thuận; cột âm = tương quan nghịch với thời gian sống.
+        </div>
+        <div class="chart-wrap"><canvas id="cfTop"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">🧠 Đặc trưng quan trọng (Random Forest)</div>
+        <div class="chart-card__desc">
+          Mức đóng góp của từng biến vào mô hình dự đoán tình trạng sống còn.
+        </div>
+        <div class="chart-wrap"><canvas id="cfImportance"></canvas></div>
+      </div>
+    </div>
+
+    <div class="chart-grid two">
+      <div class="chart-card">
+        <div class="chart-card__title">💚 So sánh trung bình Alive vs Dead</div>
+        <div class="chart-card__desc">
+          Chỉ số trung bình của từng biến ở nhóm Alive và nhóm Dead — cột càng chênh lệch
+          thì biến đó càng phân biệt tốt.
+        </div>
+        <div class="chart-wrap"><canvas id="cfAliveDead"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">📊 Phân bố đặc trưng tương quan mạnh nhất</div>
+        <div class="chart-card__desc">
+          Histogram của biến có tương quan mạnh nhất với thời gian sống.
+        </div>
+        <div class="chart-wrap"><canvas id="cfDist"></canvas></div>
       </div>
     </div>
   </section>
@@ -3020,6 +3227,81 @@ table.dt td.mono{font-family:var(--mono)}
   </section>
 
   <!-- ============================================================
+       TAB 7b — ĐÁNH GIÁ MÔ HÌNH
+       ============================================================ -->
+  <section class="tabpanel" data-panel="eval">
+    <div class="panel">
+      <div class="panel__head">
+        <h2>📊 Đánh giá mô hình học máy</h2>
+        <button class="btn btn--ghost btn--sm" data-refresh="eval">🔄</button>
+      </div>
+      <div class="panel__body">
+        <div class="stat-grid" id="evalStats"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__head">
+        <h2>📋 Bảng so sánh Test vs Train</h2>
+        <span class="muted" id="evalInfo">—</span>
+      </div>
+      <div class="panel__body">
+        <div class="table-wrap" id="evalTable"></div>
+        <div class="note" style="margin-top:14px">
+          <strong>Overfit Gap = Test − Train.</strong> Nếu gap quá âm (ví dụ &lt; −0.1) → mô hình
+          học vẹt; nếu gần 0 → mô hình tổng quát hoá tốt.
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-grid two">
+      <div class="chart-card">
+        <div class="chart-card__title">📈 ROC Curve — so sánh 4 mô hình</div>
+        <div class="chart-card__desc">
+          Đường cong ROC càng tiến sát góc trên-trái thì khả năng phân loại càng tốt.
+        </div>
+        <div class="chart-wrap"><canvas id="evalRoc"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card__title">📊 So sánh chỉ số Test (Accuracy / Precision / Recall / F1 / AUC)</div>
+        <div class="chart-card__desc">
+          Nhóm cột cho biết mô hình nào vượt trội ở từng chỉ số.
+        </div>
+        <div class="chart-wrap"><canvas id="evalBars"></canvas></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__head"><h2>🎯 Confusion Matrix — chọn mô hình để xem chi tiết</h2></div>
+      <div class="panel__body">
+        <div class="filter-grid" style="margin-bottom:14px">
+          <div class="filter-field">
+            <label>Mô hình</label>
+            <select id="evalModelPick"></select>
+          </div>
+        </div>
+        <div class="chart-grid two">
+          <div class="chart-card">
+            <div class="chart-card__title">🎯 Confusion Matrix — Test</div>
+            <div class="chart-card__desc">
+              Ô trên-trái: TN · trên-phải: FP · dưới-trái: FN · dưới-phải: TP.
+            </div>
+            <div class="chart-wrap"><canvas id="evalCmTest"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-card__title">🎯 Confusion Matrix — Train</div>
+            <div class="chart-card__desc">
+              So sánh với Test để phát hiện overfit.
+            </div>
+            <div class="chart-wrap"><canvas id="evalCmTrain"></canvas></div>
+          </div>
+        </div>
+        <div class="meta" id="evalCmMeta" style="margin-top:16px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================
        TAB 8 — SVM 30 đặc trưng
        ============================================================ -->
   <section class="tabpanel" data-panel="svm">
@@ -3176,7 +3458,9 @@ const Api = (() => {
     survival:    (p) => post("/api/analysis/survival", p),
     kaplanMeier: (p) => post("/api/analysis/kaplan-meier", p),
     compare:     (p) => post("/api/analysis/compare", p),
+    corrFeatures:(p) => post("/api/analysis/correlation-features", p),
     train:       () => post("/api/ml/train", {}),
+    evaluation:  () => request("/api/ml/evaluation"),
     mlPredict:   (p) => post("/api/ml/predict", p),
     me:          () => request("/api/auth/me"),
     logout:      () => post("/api/auth/logout", {}),
@@ -3859,6 +4143,141 @@ const Dashboard = (() => {
   }
 
   /* ============================================================
+     CORRELATION & FEATURES — Tương quan & đặc trưng
+     ============================================================ */
+  async function loadCorrFeat() {
+    try {
+      const d = await Api.corrFeatures({filters: state.filters});
+      const cols = d.columns || [];
+
+      $("cfStats").innerHTML =
+        statCard("🧮", "Số biến số", cols.length, "blue") +
+        statCard("📈", "Tổng dòng", d.total, "gray") +
+        statCard("🏆", "Top tương quan",
+          d.top_features[0] ? d.top_features[0].feature.replace(/_/g, " ") : "—", "green") +
+        statCard("💥", "Hệ số mạnh nhất",
+          d.top_features[0] ? d.top_features[0].correlation.toFixed(3) : "—", "red");
+
+      // ---- HEATMAP ----
+      if (cols.length && typeof Chart.registry.getController("matrix") !== "undefined") {
+        const pts = [];
+        cols.forEach(r => cols.forEach(c =>
+          pts.push({x: c, y: r, v: d.correlation[r]?.[c] ?? 0})));
+        Charts.destroy("cfHeatmap");
+        const el = document.getElementById("cfHeatmap");
+        if (el) new Chart(el.getContext("2d"), {
+          type: "matrix",
+          data: {datasets: [{
+            data: pts,
+            backgroundColor: (c) => {
+              const v = c.raw?.v ?? 0;
+              const a = Math.min(1, Math.abs(v));
+              if (v >= 0) return `rgba(99,102,241,${0.15 + 0.8 * a})`;
+              return `rgba(239,68,68,${0.15 + 0.8 * a})`;
+            },
+            width:  ({chart}) => ((chart.chartArea||{width:600}).width / cols.length) - 2,
+            height: ({chart}) => ((chart.chartArea||{height:420}).height / cols.length) - 2,
+          }]},
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {legend: {display: false},
+              tooltip: {callbacks: {
+                title: () => "",
+                label: (c) => `${c.raw.y} × ${c.raw.x}: ${c.raw.v}`
+              }}}
+            ,
+            scales: {
+              x: {type: "category", labels: cols,
+                  ticks: {color: Charts.textColor(), font: {size: 9}}, grid: {display: false}},
+              y: {type: "category", labels: cols,
+                  ticks: {color: Charts.textColor(), font: {size: 9}}, grid: {display: false}},
+            }
+          }
+        });
+      }
+
+      // ---- TOP 10 ----
+      const top = d.top_features || [];
+      if (top.length) {
+        const colors = top.map(t => t.correlation >= 0 ? "rgba(16,185,129,.85)" : "rgba(239,68,68,.85)");
+        Charts.make("cfTop", {
+          type: "bar",
+          data: {
+            labels: top.map(t => t.feature.replace(/_/g, " ")),
+            datasets: [{label: "Tương quan", data: top.map(t => t.correlation),
+              backgroundColor: colors, borderRadius: 8, borderSkipped: false, maxBarThickness: 28}]
+          },
+          options: {...Charts.baseOpts(), indexAxis: "y",
+            scales: {
+              x: {ticks: {color: Charts.textColor()}, grid: {color: Charts.gridColor()}},
+              y: {ticks: {color: Charts.textColor()}, grid: {display: false}}
+            }}
+        });
+      }
+
+      // ---- FEATURE IMPORTANCE ----
+      const fi = (d.feature_importance || []).slice(0, 15);
+      if (fi.length) {
+        const c = document.getElementById("cfImportance")?.getContext("2d");
+        let g = CLR.blue;
+        if (c) { g = c.createLinearGradient(0, 0, 400, 0);
+          g.addColorStop(0, "#818cf8"); g.addColorStop(1, "#ec4899"); }
+        Charts.make("cfImportance", {
+          type: "bar",
+          data: {
+            labels: fi.map(f => f.feature.replace(/_/g, " ")),
+            datasets: [{label: "Importance", data: fi.map(f => f.importance),
+              backgroundColor: g, borderRadius: 8, borderSkipped: false, maxBarThickness: 22}]
+          },
+          options: {...Charts.baseOpts(), indexAxis: "y",
+            scales: {
+              x: {ticks: {color: Charts.textColor()}, grid: {color: Charts.gridColor()}},
+              y: {ticks: {color: Charts.textColor()}, grid: {display: false}}
+            }}
+        });
+      }
+
+      // ---- ALIVE vs DEAD ----
+      const ad = d.alive_dead || {};
+      const adCols = Object.keys(ad).slice(0, 8);
+      if (adCols.length) {
+        Charts.make("cfAliveDead", {
+          type: "bar",
+          data: {
+            labels: adCols.map(c => c.replace(/_/g, " ")),
+            datasets: [
+              {label: "Alive (mean)", data: adCols.map(c => ad[c].alive_mean || 0),
+               backgroundColor: "rgba(16,185,129,.8)", borderRadius: 6, maxBarThickness: 28},
+              {label: "Dead (mean)",  data: adCols.map(c => ad[c].dead_mean || 0),
+               backgroundColor: "rgba(239,68,68,.8)", borderRadius: 6, maxBarThickness: 28},
+            ]
+          },
+          options: Charts.baseOpts()
+        });
+      }
+
+      // ---- DISTRIBUTIONS ----
+      const distKeys = Object.keys(d.distributions || {}).slice(0, 1);
+      if (distKeys.length) {
+        const k = distKeys[0], dist = d.distributions[k];
+        const c = document.getElementById("cfDist")?.getContext("2d");
+        let g = CLR.cyan;
+        if (c) { g = c.createLinearGradient(0, 0, 0, 280);
+          g.addColorStop(0, "#67e8f9"); g.addColorStop(1, "#0891b2"); }
+        Charts.make("cfDist", {
+          type: "bar",
+          data: {labels: dist.labels, datasets: [{label: k.replace(/_/g, " "),
+            data: dist.counts, backgroundColor: g, borderRadius: 6, maxBarThickness: 40}]},
+          options: {...Charts.baseOpts(),
+            plugins: {...Charts.baseOpts().plugins,
+              title: {display: true, text: `Phân bố: ${k.replace(/_/g, " ")}`,
+                color: Charts.textColor(), font: {size: 12, weight: "600"}}}}
+        });
+      }
+    } catch (e) { $("cfStats").innerHTML = `<div class="alert">${e.message}</div>`; }
+  }
+
+  /* ============================================================
      KAPLAN–MEIER — Đường cong sống còn
      ============================================================ */
   const KM_PALETTE = [
@@ -4152,6 +4571,185 @@ const Dashboard = (() => {
     }
   }
 
+  /* ============================================================
+     MODEL EVALUATION — Đánh giá mô hình
+     ============================================================ */
+  async function loadEval() {
+    try {
+      await ensureModel();
+      const d = await Api.evaluation();
+      const models = d.models || [];
+      const best = models.find(m => m.name === d.best_model);
+
+      $("evalInfo").textContent =
+        `Train: ${d.train_size} · Test: ${d.test_size} · ` +
+        `Alive: ${d.class_balance.alive || 0} · Dead: ${d.class_balance.dead || 0}`;
+
+      $("evalStats").innerHTML =
+        statCard("🥇", "Mô hình tốt nhất", d.best_model || "—", "green") +
+        statCard("🎯", "AUC tốt nhất", best ? best.test.auc.toFixed(3) : "—", "blue") +
+        statCard("📊", "Accuracy tốt nhất", best ? best.test.accuracy.toFixed(3) : "—", "gray") +
+        statCard("🧪", "Số mô hình", models.length, "purple");
+
+      // ---- BẢNG SO SÁNH ----
+      const rows = models.map(m => ({
+        model: m.name,
+        "test_acc":  m.test.accuracy,
+        "train_acc": m.train.accuracy,
+        "gap_acc":   m.overfit.accuracy_gap,
+        "test_auc":  m.test.auc,
+        "train_auc": m.train.auc,
+        "gap_auc":   m.overfit.auc_gap,
+        "precision": m.test.precision,
+        "recall":    m.test.recall,
+        "f1":        m.test.f1,
+      }));
+      buildTable("evalTable",
+        ["model","test_acc","train_acc","gap_acc","test_auc","train_auc","gap_auc","precision","recall","f1"],
+        rows);
+
+      // ---- ROC ----
+      const palette = ["#6366f1","#ec4899","#10b981","#f59e0b","#06b6d4","#a855f7"];
+      const rocDatasets = models.map((m, i) => ({
+        label: `${m.name} (AUC=${m.test.auc.toFixed(3)})`,
+        data: m.test.roc.fpr.map((x, k) => ({x, y: m.test.roc.tpr[k]})),
+        borderColor: palette[i % palette.length],
+        backgroundColor: palette[i % palette.length] + "22",
+        borderWidth: 2.5, pointRadius: 0, tension: 0.15, fill: false,
+      }));
+      rocDatasets.push({
+        label: "Random (AUC=0.5)",
+        data: [{x: 0, y: 0}, {x: 1, y: 1}],
+        borderColor: Charts.textColor(), borderDash: [6, 5], borderWidth: 1.5,
+        pointRadius: 0, fill: false,
+      });
+
+      Charts.make("evalRoc", {
+        type: "line",
+        data: {datasets: rocDatasets},
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: {legend: {position: "bottom",
+            labels: {color: Charts.textColor(), usePointStyle: true, padding: 12}}},
+          scales: {
+            x: {type: "linear", min: 0, max: 1,
+                title: {display: true, text: "False Positive Rate",
+                  color: Charts.textColor()},
+                ticks: {color: Charts.textColor()}, grid: {color: Charts.gridColor()}},
+            y: {min: 0, max: 1,
+                title: {display: true, text: "True Positive Rate",
+                  color: Charts.textColor()},
+                ticks: {color: Charts.textColor()}, grid: {color: Charts.gridColor()}},
+          }
+        }
+      });
+
+      // ---- SO SÁNH 5 CHỈ SỐ ----
+      Charts.make("evalBars", {
+        type: "bar",
+        data: {
+          labels: models.map(m => m.name),
+          datasets: [
+            {label:"Accuracy",  data: models.map(m => m.test.accuracy),
+             backgroundColor:"rgba(99,102,241,.85)", borderRadius:6, maxBarThickness:26},
+            {label:"Precision", data: models.map(m => m.test.precision),
+             backgroundColor:"rgba(16,185,129,.85)", borderRadius:6, maxBarThickness:26},
+            {label:"Recall",    data: models.map(m => m.test.recall),
+             backgroundColor:"rgba(245,158,11,.85)", borderRadius:6, maxBarThickness:26},
+            {label:"F1",        data: models.map(m => m.test.f1),
+             backgroundColor:"rgba(6,182,212,.85)", borderRadius:6, maxBarThickness:26},
+            {label:"AUC",       data: models.map(m => m.test.auc),
+             backgroundColor:"rgba(236,72,153,.85)", borderRadius:6, maxBarThickness:26},
+          ]
+        },
+        options: Charts.baseOpts()
+      });
+
+      // ---- CONFUSION MATRIX PICKER ----
+      const pick = $("evalModelPick");
+      pick.innerHTML = models.map(m => `<option value="${m.name}">${m.name}</option>`).join("");
+
+      function drawCm(canvasId, cm, title) {
+        // cm = [[TN, FP], [FN, TP]]
+        const tn = cm[0][0], fp = cm[0][1], fn = cm[1][0], tp = cm[1][1];
+        const total = tn + fp + fn + tp || 1;
+        const max = Math.max(tn, fp, fn, tp, 1);
+
+        Charts.make(canvasId, {
+          type: "matrix",
+          data: {datasets: [{
+            data: [
+              {x:"Pred Alive", y:"True Alive", v:tn},
+              {x:"Pred Dead",  y:"True Alive", v:fp},
+              {x:"Pred Alive", y:"True Dead",  v:fn},
+              {x:"Pred Dead",  y:"True Dead",  v:tp},
+            ],
+            backgroundColor: (c) => {
+              const v = c.raw?.v ?? 0;
+              const a = 0.15 + 0.85 * (v / max);
+              const cell = c.raw;
+              if (!cell) return "rgba(148,163,184,.3)";
+              const isCorrect = (cell.y === "True Alive" && cell.x === "Pred Alive") ||
+                                (cell.y === "True Dead"  && cell.x === "Pred Dead");
+              return isCorrect
+                ? `rgba(16,185,129,${a})`
+                : `rgba(239,68,68,${a})`;
+            },
+            width:  ({chart}) => ((chart.chartArea||{width:400}).width / 2) - 6,
+            height: ({chart}) => ((chart.chartArea||{height:300}).height / 2) - 6,
+          }]},
+          options: {
+            responsive:true, maintainAspectRatio:false,
+            plugins: {
+              legend: {display:false},
+              title: {display: true, text: title, color: Charts.textColor(),
+                font: {size: 12, weight: "600"}},
+              tooltip: {
+                callbacks: {
+                  title: () => "",
+                  label: (c) => `${c.raw.y} / ${c.raw.x}: ${c.raw.v} (${((c.raw.v/total)*100).toFixed(1)}%)`
+                }
+              }
+            },
+            scales: {
+              x: {type:"category", labels:["Pred Alive","Pred Dead"],
+                  ticks:{color:Charts.textColor()}, grid:{display:false}},
+              y: {type:"category", labels:["True Alive","True Dead"],
+                  ticks:{color:Charts.textColor()}, grid:{display:false}},
+            }
+          }
+        });
+      }
+
+      function renderCmForModel(name) {
+        const m = models.find(x => x.name === name);
+        if (!m) return;
+        drawCm("evalCmTest",  m.test.confusion_matrix,  `Test — ${name}`);
+        drawCm("evalCmTrain", m.train.confusion_matrix, `Train — ${name}`);
+        const [tn, fp] = m.test.confusion_matrix[0];
+        const [fn, tp] = m.test.confusion_matrix[1];
+        const total = tn + fp + fn + tp || 1;
+        const acc  = ((tp + tn) / total).toFixed(4);
+        const prec = (tp + fp) ? (tp / (tp + fp)).toFixed(4) : "0";
+        const rec  = (tp + fn) ? (tp / (tp + fn)).toFixed(4) : "0";
+        $("evalCmMeta").innerHTML = `
+          <div class="meta__row"><span class="meta__key">True Negatives (TN)</span><span class="meta__val">${tn}</span></div>
+          <div class="meta__row"><span class="meta__key">False Positives (FP)</span><span class="meta__val">${fp}</span></div>
+          <div class="meta__row"><span class="meta__key">False Negatives (FN)</span><span class="meta__val">${fn}</span></div>
+          <div class="meta__row"><span class="meta__key">True Positives (TP)</span><span class="meta__val">${tp}</span></div>
+          <div class="meta__row"><span class="meta__key">Accuracy</span><span class="meta__val">${acc}</span></div>
+          <div class="meta__row"><span class="meta__key">Precision</span><span class="meta__val">${prec}</span></div>
+          <div class="meta__row"><span class="meta__key">Recall</span><span class="meta__val">${rec}</span></div>`;
+      }
+
+      if (!state._evalCmBound) {
+        state._evalCmBound = true;
+        pick.addEventListener("change", () => renderCmForModel(pick.value));
+      }
+      renderCmForModel(pick.value || (models[0] && models[0].name));
+    } catch (e) { $("evalStats").innerHTML = `<div class="alert">${e.message}</div>`; }
+  }
+
   async function ensureModel() {
     try { return await Api.train(); } catch(e) { return null; }
   }
@@ -4161,14 +4759,16 @@ const Dashboard = (() => {
       if (name === "overview") {
         // Trang tổng quan chỉ hiển thị giới thiệu — không tải dữ liệu
       }
-      else if (name === "data") { await loadMeta(); buildFilterUI(); await loadDataTable(); }
+      else if (name === "data")     { await loadMeta(); buildFilterUI(); await loadDataTable(); }
+      else if (name === "corrfeat") { await loadCorrFeat(); }
       else if (name === "patients") { await loadPatients(); }
-      else if (name === "disease") { await loadDisease(); }
-      else if (name === "biology") { await loadBiology(); }
+      else if (name === "disease")  { await loadDisease(); }
+      else if (name === "biology")  { await loadBiology(); }
       else if (name === "survival") { await loadSurvival(); }
       else if (name === "km")       { await loadKaplanMeier(); }
       else if (name === "compare")  { await loadCompare(); }
       else if (name === "predict")  { await ensureModel(); }
+      else if (name === "eval")     { await loadEval(); }
     } catch(e) { console.error("[load]", name, e); }
   }
 
@@ -4249,16 +4849,41 @@ const Wizard = (() => {
       const cls = isAlive ? "alive" : "dead";
       const icon = isAlive ? "🟢" : "🔴";
       const mainProb = isAlive ? d.probability_alive : d.probability_dead;
+      const otherProb = isAlive ? d.probability_dead : d.probability_alive;
+      const otherLabel = isAlive ? "Dead" : "Alive";
+
+      // Mức độ tin cậy: >=85% cao, >=65% trung bình, còn lại thấp
+      const confidence = mainProb >= 0.85 ? "Cao" : mainProb >= 0.65 ? "Trung bình" : "Thấp";
+      const confidenceColor = mainProb >= 0.85 ? "#10b981" : mainProb >= 0.65 ? "#f59e0b" : "#ef4444";
+
+      const pct = (mainProb * 100).toFixed(1);
+      const otherPct = (otherProb * 100).toFixed(1);
+
       result.innerHTML = `
         <div class="predict-result predict-result--${cls}">
           <div class="predict-result__icon">${icon}</div>
           <div class="predict-result__label">${d.prediction}</div>
-          <div class="predict-result__prob">Xác suất: <strong>${(mainProb*100).toFixed(1)}%</strong></div>
+          <div class="predict-result__prob">Xác suất: <strong>${pct}%</strong></div>
         </div>
+
+        <div class="prob" style="margin-top:18px">
+          <div class="prob__head">
+            <span>🎯 Điểm tin cậy dự đoán</span>
+            <span style="color:${confidenceColor};font-weight:800">${confidence} · ${pct}%</span>
+          </div>
+          <div class="prob__track">
+            <div class="prob__fill ${isAlive ? 'prob__fill--green' : 'prob__fill--red'}"
+                 style="width:${pct}%"></div>
+          </div>
+        </div>
+
         <div class="predict-meta">
           <p>Mô hình sử dụng: <strong>${d.model}</strong></p>
           <p>P(Alive) = <strong>${(d.probability_alive*100).toFixed(1)}%</strong> ·
-             P(Dead) = <strong>${(d.probability_dead*100).toFixed(1)}%</strong></p>
+             P(Dead)  = <strong>${(d.probability_dead*100).toFixed(1)}%</strong></p>
+          <p style="margin-top:6px;color:var(--text-soft)">
+            Khoảng cách xác suất so với nhãn còn lại (${otherLabel}): <strong>${otherPct}%</strong>
+          </p>
           <p style="margin-top:8px;color:var(--text-soft)">
             Kết quả chỉ mang tính tham khảo, không thay thế kết luận của bác sĩ.
           </p>
